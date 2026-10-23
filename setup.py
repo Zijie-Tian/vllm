@@ -1540,10 +1540,18 @@ if _is_hip():
 
 if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
-    if USE_PRECOMPILED_EXTENSIONS or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
+    # FA3 kernels are Hopper-only (9.0a). An explicit Ampere list must not
+    # request that target: its nvcc step fails when FA3_ARCHS is empty.
+    fa_archs = os.getenv("TORCH_CUDA_ARCH_LIST")
+    fa3_requested = fa_archs is None or any(
+        part.split("+", 1)[0].strip().startswith("9")
+        for part in fa_archs.replace(";", " ").split()
+        if part.strip()
+    )
+    if fa3_requested and (
+        USE_PRECOMPILED_EXTENSIONS
+        or (CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3"))
     ):
-        # FA3 requires CUDA 12.3 or later
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
     # FA4 CuteDSL - Python-only component for FA4's cute DSL support
     # Optional since this doesn't produce a .so file, just copies Python files

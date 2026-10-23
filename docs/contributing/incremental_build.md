@@ -1,17 +1,15 @@
 # Incremental Compilation Workflow
 
-When working on vLLM's C++/CUDA kernels located in the `csrc/` directory, recompiling the entire project with `uv pip install -e .` for every change can be time-consuming. An incremental compilation workflow using CMake allows for faster iteration by only recompiling the necessary components after an initial setup. This guide details how to set up and use such a workflow, which complements your editable Python installation.
+When working on vLLM's C++/CUDA kernels located in the `csrc/` directory, recompiling the entire project for every change can be time-consuming. An incremental compilation workflow using CMake allows for faster iteration by only recompiling the necessary components after an initial setup. This guide details how to set up and use such a workflow, which complements the editable install in the Conda environment `mxmoe`.
 
 ## Prerequisites
 
 Before setting up the incremental build:
 
-1. **vLLM Editable Install:** Ensure you have vLLM installed from source in an editable mode. Using pre-compiled wheels for the initial editable setup can be faster, as the CMake workflow will handle subsequent kernel recompilations.
+1. **vLLM Editable Install:** Configure the shared dependencies, CUDA 13.0 toolchain, and source-cache variables using the parent [MxMoE environment guide](../../../../doc/environment.md). Reuse the editable install in `mxmoe`; do not create `.venv` or enable precompiled vLLM.
 
     ```console
-    uv venv --python 3.12 --seed
-    source .venv/bin/activate
-    VLLM_USE_PRECOMPILED=1 uv pip install -U -e . --torch-backend=auto
+    conda run --no-capture-output -n mxmoe python -m pip install --no-build-isolation --no-deps --editable .
     ```
 
 2. **CUDA Toolkit:** Verify that the NVIDIA CUDA Toolkit is correctly installed and `nvcc` is accessible in your `PATH`. CMake relies on `nvcc` to compile CUDA code. You can typically find `nvcc` in `$CUDA_HOME/bin/nvcc` or by running `which nvcc`. If you encounter issues, refer to the [official CUDA Toolkit installation guides](https://developer.nvidia.com/cuda-toolkit-archive) and vLLM's main [GPU installation documentation](../getting_started/installation/gpu.md#troubleshooting) for troubleshooting. The `CMAKE_CUDA_COMPILER` variable in your `CMakeUserPresets.json` should also point to your `nvcc` binary.
@@ -19,7 +17,7 @@ Before setting up the incremental build:
 3. **Build Tools:** It is highly recommended to install `ccache` for fast rebuilds by caching compilation results (e.g., `sudo apt install ccache` or `conda install ccache`). Also, ensure the core build dependencies like `cmake` and `ninja` are installed. These are installable through `requirements/build/cuda.txt` or your system's package manager.
 
     ```console
-    uv pip install -r requirements/build/cuda.txt --torch-backend=auto
+    conda run --no-capture-output -n mxmoe python -m pip install -r ../../requirements.txt
     ```
 
 ## Setting up the CMake Build Environment
@@ -35,7 +33,7 @@ To simplify the setup, vLLM provides a helper script that attempts to auto-detec
 Navigate to the root of your vLLM clone and execute the following command:
 
 ```console
-python tools/generate_cmake_presets.py
+conda run --no-capture-output -n mxmoe python tools/generate_cmake_presets.py
 ```
 
 The script will prompt you if it cannot automatically determine certain paths (e.g., `nvcc` or a specific Python executable for your vLLM development environment). Follow the on-screen prompts. If an existing `CMakeUserPresets.json` is found, the script will ask for confirmation before overwriting it.
@@ -45,7 +43,7 @@ The script will prompt you if it cannot automatically determine certain paths (e
 To automatically overwrite an existing `CMakeUserPresets.json` without prompting, use the `--force-overwrite` flag:
 
 ```console
-python tools/generate_cmake_presets.py --force-overwrite
+conda run --no-capture-output -n mxmoe python tools/generate_cmake_presets.py --force-overwrite
 ```
 
 This is particularly useful in automated scripts or CI/CD environments where interactive prompts are not desired.
@@ -75,7 +73,7 @@ Below is an example of what the generated `CMakeUserPresets.json` might look lik
                 "CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
                 "CMAKE_CUDA_COMPILER_LAUNCHER": "ccache",
                 "CMAKE_BUILD_TYPE": "Release",
-                "VLLM_PYTHON_EXECUTABLE": "/home/user/venvs/vllm/bin/python",
+                "VLLM_PYTHON_EXECUTABLE": "<mxmoe interpreter>",
                 "CMAKE_INSTALL_PREFIX": "${sourceDir}",
                 "CMAKE_CUDA_FLAGS": "",
                 "NVCC_THREADS": "4",
@@ -110,21 +108,21 @@ Once your `CMakeUserPresets.json` is configured:
    This step configures the build system according to your chosen preset (e.g., `release`) and creates the build directory at `binaryDir`
 
     ```console
-    cmake --preset release
+    conda run --no-capture-output -n mxmoe cmake --preset release
     ```
 
 2. **Build and install the vLLM components:**
    This command compiles the code and installs the resulting binaries into your vLLM source directory, making them available to your editable Python installation.
 
     ```console
-    cmake --build --preset release --target install
+    conda run --no-capture-output -n mxmoe cmake --build --preset release --target install
     ```
 
 3. **Make changes and repeat!**
     Now you start using your editable install of vLLM, testing and making changes as needed. If you need to build again to update based on changes, simply run the CMake command again to build only the affected files.
 
     ```console
-    cmake --build --preset release --target install
+    conda run --no-capture-output -n mxmoe cmake --build --preset release --target install
     ```
 
 ## Verifying the Build

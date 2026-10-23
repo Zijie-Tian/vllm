@@ -41,44 +41,32 @@ If work is duplicate/trivial busywork, **do not proceed**. Return a short explan
 
 ## 2. Development Workflow
 
-- **Never use system `python3` or bare `pip`/`pip install`.** All Python commands must go through `uv` and `.venv/bin/python`.
+- **Never use system `python3`, bare `pip`, `uv venv`, or `.venv`.** Every test, smoke check, and native build in this checkout uses the Conda environment `mxmoe`.
+- Follow the parent [unified environment guide](../../doc/environment.md) for both accuracy and performance. Run `conda run --no-capture-output -n mxmoe python ...`, or activate `mxmoe` first; apply the parent `constraints.txt` to additional dependency installs.
 
 ### Environment setup
 
 ```bash
-# Install `uv` if you don't have it already:
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Always use `uv` for Python environment management:
-uv venv --python 3.12
-source .venv/bin/activate
-
-# Always make sure `pre-commit` and its hooks are installed:
-uv pip install -r requirements/lint.txt
-pre-commit install
+conda run --no-capture-output -n mxmoe python -m pip install -c ../../constraints.txt -r requirements/lint.txt
+conda run --no-capture-output -n mxmoe pre-commit install
 ```
 
 ### Installing dependencies
 
+Install the shared dependencies using the parent guide first. Keep vLLM as a source-editable install in `mxmoe`, not a precompiled package or a second environment. With the guide's toolchain and source-cache variables set, rebuild with:
+
 ```bash
-# Start with precompiled artifacts for an editable install:
-VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
+conda run --no-capture-output -n mxmoe python -m pip install --no-build-isolation --no-deps --editable .
 ```
 
 For C/C++ or CUDA changes, follow the
-[incremental compilation workflow](docs/contributing/incremental_build.md) to
-configure and perform incremental builds.
+[incremental compilation workflow](docs/contributing/incremental_build.md).
 
 ### Tests
 
-> Requires [Environment setup](#environment-setup) and [Installing dependencies](#installing-dependencies).
-
 ```bash
-# Install test dependencies (use cuda.in on non-x86_64):
-uv pip install -r requirements/test/cuda.in
-
-# Run a specific test file:
-.venv/bin/python -m pytest tests/path/to/test_file.py -v
+conda run --no-capture-output -n mxmoe python -m pip install -c ../../constraints.txt -r requirements/test/cuda.in
+conda run --no-capture-output -n mxmoe python -m pytest tests/path/to/test_file.py -v
 ```
 
 When adding tests:
@@ -107,13 +95,13 @@ For model-specific requirements, see
 
 ```bash
 # Run all pre-commit hooks on staged files:
-pre-commit run
+conda run --no-capture-output -n mxmoe pre-commit run
 
 # Run on all files:
-pre-commit run --all-files
+conda run --no-capture-output -n mxmoe pre-commit run --all-files
 
 # Run a specific hook:
-pre-commit run ruff-check --all-files
+conda run --no-capture-output -n mxmoe pre-commit run ruff-check --all-files
 ```
 
 The line length limit for Python code is 88 characters. If you are not sure, use pre-commit to check.
