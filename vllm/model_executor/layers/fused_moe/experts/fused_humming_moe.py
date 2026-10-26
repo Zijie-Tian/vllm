@@ -49,6 +49,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
     kFp8StaticChannelSym,
     kFp8StaticTensorSym,
+    kInt4DynamicTokenSym,
     kInt4Static,
     kInt8DynamicTokenSym,
     kInt8Static,
@@ -356,7 +357,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             (kMxfp8Static, kMxfp8Dynamic),
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A or (
-            activation_key in (None, kFp8DynamicTokenSym, kInt8DynamicTokenSym)
+            activation_key in (None, kFp8DynamicTokenSym, kInt8DynamicTokenSym, kInt4DynamicTokenSym)
             and _is_supported_wna16_weight_key(weight_key)
         )
 

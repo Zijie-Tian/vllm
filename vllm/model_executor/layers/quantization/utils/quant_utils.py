@@ -207,6 +207,7 @@ kStaticChannelScale = ScaleDesc(torch.float32, True, GroupShape.PER_CHANNEL)
 kFp8StaticChannelSym = QuantKey(FP8_DTYPE, kStaticChannelScale, symmetric=True)
 
 kDynamicTokenScale = ScaleDesc(torch.float32, False, GroupShape.PER_TOKEN)
+kInt4DynamicTokenSym = QuantKey(scalar_types.int4, kDynamicTokenScale, symmetric=True)
 kFp8DynamicTokenSym = QuantKey(FP8_DTYPE, kDynamicTokenScale, symmetric=True)
 
 kNvfp4DynamicGroupScale = ScaleDesc(FP8_DTYPE, False, GroupShape(1, 16))

@@ -786,6 +786,10 @@ class HummingMoEMethod(FusedMoEMethodBase):
                 tensor = torch.empty(attrs["shape"], dtype=attrs["dtype"])
                 param = torch.nn.Parameter(tensor, requires_grad=False)
                 extra_attrs = attrs.get("extra_attrs", {}).copy()
+                if name == "weight_zero_point":
+                    # Packed zero points share the scales' group/channel partitioning.
+                    scale_attrs = configs["tensors_attrs"]["weight_scale"]["extra_attrs"]
+                    extra_attrs.setdefault("scale_type", scale_attrs["scale_type"])
                 extra_attrs.update(extra_weight_attrs)
                 param = prepare_moe_param(tensor, name, extra_attrs)
                 setattr(layer, f"{sublayer_name}_{name}", param)

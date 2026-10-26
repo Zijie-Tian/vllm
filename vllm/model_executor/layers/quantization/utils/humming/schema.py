@@ -62,6 +62,7 @@ if has_humming():
         humming_dtypes.float8e3m4: FP8_DTYPE,
         humming_dtypes.float8e4m3: FP8_DTYPE,
         humming_dtypes.float8e5m2: torch.float8_e5m2,
+        humming_dtypes.int4: scalar_types.int4,
         humming_dtypes.int8: torch.int8,
         humming_dtypes.uint4: INT4_DTYPE,
         humming_dtypes.uint8: INT8_DTYPE,
