@@ -135,6 +135,7 @@ MoEBackend = Literal[
     "flashinfer_moe_ep_mega_deep_gemm",
     "marlin",
     "humming",
+    "mxmoe",
     "triton_unfused",
     "aiter",
     "aiter_mega_moe",
@@ -316,6 +317,10 @@ class KernelConfig:
       DeepSeek-V4 only)
     - "marlin": Use Marlin kernels (weight-only quantization)
     - "humming": Use Humming Mixed Precision kernels
+    - "mxmoe": Use MxMoE grouped GEMM for routed experts (explicit
+      selection only; asymmetric W2/W4/W8 group128 weights, FP16 interface,
+      TP=1, PP=1). Optional per-projection A4/A8 via mxmoe_activation_config.
+      Does not change dense or shared-expert linear backends
     - "triton_unfused": Use Triton unfused MoE kernels
     - "aiter": Use AMD AITer kernels (ROCm only)
     - "aiter_mega_moe": Use the AITER MegaMoE fused dispatch/GEMM/combine
@@ -328,6 +333,13 @@ class KernelConfig:
     - "hpc": Use HPC kernels (FP8 and Hopper only)
     - "emulation": use BF16/FP16 GEMM, dequantizing weights and
                    running QDQ on activations.
+    """
+
+    mxmoe_activation_config: str | None = None
+    """MxMoE qconfig JSON for per-routed-expert Gate/Up/Down A4/A8/A16.
+
+    Requires moe_backend="mxmoe" and matching checkpoint weight metadata.
+    A4/A8 is symmetric dynamic per-token; omitted means unchanged A16.
     """
 
     sparse_indexer_topk_backend: SparseIndexerTopkBackend = "auto"
@@ -419,6 +431,12 @@ class KernelConfig:
         if self.linear_backend_per_quant is None:
             ignored_factors.add("linear_backend_per_quant")
         factors = get_hash_factors(self, ignored_factors)
+        if self.mxmoe_activation_config is not None:
+            from mxmoe.vllm import activation_config_digest
+
+            factors["mxmoe_activation_config"] = activation_config_digest(
+                self.mxmoe_activation_config
+            )
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
         return hash_factors(factors)
 
@@ -438,6 +456,13 @@ class KernelConfig:
     def set_platform_defaults(self, vllm_config: "VllmConfig") -> None:
         """Set platform-specific defaults for the kernel config."""
         from vllm.platforms import current_platform
+
+        # EngineArgs applies top-level overrides after dataclass validation.
+        self.moe_backend = self._normalize_moe_backend(self.moe_backend)
+        if self.moe_backend == "mxmoe" or self.mxmoe_activation_config is not None:
+            from mxmoe.vllm import validate_kernel_selection
+
+            validate_kernel_selection(self, vllm_config)
 
         if vllm_config.model_config is not None:
             validate_flashinfer_moe_ep_model(

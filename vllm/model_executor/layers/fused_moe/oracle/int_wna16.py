@@ -56,6 +56,7 @@ class WNA16MoEBackend(Enum):
     MARLIN = "MARLIN"
     BATCHED_MARLIN = "BATCHED_MARLIN"
     HUMMING = "HUMMING"
+    MXMOE = "MXMOE"
     CPU = "CPU"
     ZEN_CPU = "ZEN_CPU"
     FLASHINFER_TRTLLM = "FLASHINFER_TRTLLM"
@@ -81,6 +82,10 @@ def backend_to_kernel_cls(
             HummingGroupedExperts,
             HummingIndexedExperts,
         ]
+    elif backend == WNA16MoEBackend.MXMOE:
+        from mxmoe.vllm.experts import MxMoEExperts
+
+        return [MxMoEExperts]
     elif backend == WNA16MoEBackend.MARLIN:
         return [MarlinExperts]
     elif backend == WNA16MoEBackend.BATCHED_MARLIN:
@@ -124,7 +129,10 @@ def backend_to_kernel_cls(
 
 
 def _get_priority_backends() -> list[WNA16MoEBackend]:
-    """Get available backends in priority order based on platform and config."""
+    """Get available backends in priority order based on platform and config.
+
+    MXMOE is intentionally absent: it is explicit ``moe_backend='mxmoe'`` only.
+    """
     if current_platform.is_cpu():
         return [WNA16MoEBackend.ZEN_CPU, WNA16MoEBackend.CPU]
     if current_platform.is_xpu():
@@ -232,6 +240,15 @@ def _backend_incompatibility_reason(
     ):
         return "the MoeWNA16 checkpoint layout is not supported"
 
+    if backend == WNA16MoEBackend.MXMOE:
+        from mxmoe.vllm.experts import mxmoe_unsupported_reason
+
+        return mxmoe_unsupported_reason(
+            moe_config,
+            quant_config,
+            may_have_zp=may_have_zp,
+            may_have_bias=may_have_bias,
+        )
     return None
 
 
@@ -241,6 +258,7 @@ def map_wna16_backend(runner_backend: MoEBackend) -> WNA16MoEBackend:
         "triton": WNA16MoEBackend.TRITON,
         "marlin": WNA16MoEBackend.MARLIN,
         "humming": WNA16MoEBackend.HUMMING,
+        "mxmoe": WNA16MoEBackend.MXMOE,
         "flashinfer_trtllm": WNA16MoEBackend.FLASHINFER_TRTLLM,
         "emulation": WNA16MoEBackend.EMULATION,
         "rdna3": WNA16MoEBackend.RDNA3,
@@ -440,8 +458,8 @@ def make_wna16_moe_kernel(
 
     # Currently, we only support TrtLlmMxint4ExpertsMonolithic, MarlinExperts,
     # BatchedMarlinExperts, XPUExpertsWNA16, CPUExpertsInt4,
-    # ZentorchExpertsInt4, the Humming grouped/indexed experts, and
-    # Int4EmulationTritonExperts
+    # ZentorchExpertsInt4, the Humming grouped/indexed experts,
+    # MxMoEExperts, and Int4EmulationTritonExperts
     allowed_experts: tuple[type[mk.FusedMoEExperts], ...] = (
         MarlinExperts,
         BatchedMarlinExperts,
@@ -453,8 +471,8 @@ def make_wna16_moe_kernel(
         Int4EmulationTritonExperts,
         Rdna3WNA16Experts,
     )
-    if backend == WNA16MoEBackend.HUMMING:
-        allowed_experts += tuple(backend_to_kernel_cls(WNA16MoEBackend.HUMMING))
+    if backend in (WNA16MoEBackend.HUMMING, WNA16MoEBackend.MXMOE):
+        allowed_experts += tuple(backend_to_kernel_cls(backend))
     assert experts_cls in allowed_experts
 
     is_monolithic = experts_cls.is_monolithic()
@@ -1593,6 +1611,22 @@ def convert_to_wna16_moe_kernel_format(
                 layer, quant_config=_humming_wna16_weight_schema(quant_config)
             )
         return None
+
+    if backend == WNA16MoEBackend.MXMOE:
+        from mxmoe.vllm.experts import convert_mxmoe_weights
+
+        return convert_mxmoe_weights(
+            layer,
+            quant_config,
+            w13,
+            w2,
+            w13_scale,
+            w2_scale,
+            w13_qzeros,
+            w2_qzeros,
+            w13_bias,
+            w2_bias,
+        )
 
     if backend in (
         WNA16MoEBackend.MARLIN,

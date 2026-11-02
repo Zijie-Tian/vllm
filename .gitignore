@@ -38,6 +38,8 @@ vllm/vllm-rs
 # Distribution / packaging
 .Python
 build/
+# The root build entry may be a symlink to an external build tree.
+/build
 !requirements/build/
 cmake-build-*/
 CMakeUserPresets.json

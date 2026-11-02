@@ -129,6 +129,13 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             # Non-Marlin WNA16 always uses bf16/fp16 inputs
             self.input_dtype = torch.bfloat16
 
+        if self.wna16_backend == WNA16MoEBackend.MXMOE:
+            from mxmoe.vllm import reject_quantized_activations
+
+            reject_quantized_activations(self.input_quant is not None)
+            # Static audit reads this field. MxMoE activations are FP16, not BF16.
+            self.input_dtype = torch.float16
+
     def _packed_dim(self, dim: int) -> int:
         return math.ceil(dim * self.num_bits / 32)
 
@@ -344,12 +351,12 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             set_weight_attrs(w2_zp, extra_weight_attrs)
 
         w2_weight_shape = torch.nn.Parameter(
-            torch.empty(num_experts, 2), requires_grad=False
+            torch.empty(num_experts, 2, dtype=torch.int64), requires_grad=False
         )
         layer.register_parameter("w2_weight_shape", w2_weight_shape)
         set_weight_attrs(w2_weight_shape, extra_weight_attrs)
         w13_weight_shape = torch.nn.Parameter(
-            torch.empty(num_experts, 2), requires_grad=False
+            torch.empty(num_experts, 2, dtype=torch.int64), requires_grad=False
         )
 
         layer.register_parameter("w13_weight_shape", w13_weight_shape)
@@ -453,10 +460,14 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         # CPU fused_experts_cpu and the RDNA3 HIP kernel require zero points
         # even for symmetric quant (the oracle synthesizes them).
         # EMULATION bakes ZP into the dequantized bf16 weights — ZP is None.
+        # MXMOE fuses raw zeros into scale_zero and returns no separate ZP.
         if (
             not self.symmetric
             or self.wna16_backend in (WNA16MoEBackend.CPU, WNA16MoEBackend.RDNA3)
-        ) and self.wna16_backend != WNA16MoEBackend.EMULATION:
+        ) and self.wna16_backend not in (
+            WNA16MoEBackend.EMULATION,
+            WNA16MoEBackend.MXMOE,
+        ):
             assert w13_qzeros is not None and w2_qzeros is not None
             replace_parameter(layer, "w13_weight_zero_point", w13_qzeros)
             replace_parameter(layer, "w2_weight_zero_point", w2_qzeros)
@@ -483,6 +494,16 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
+        if self.wna16_backend == WNA16MoEBackend.MXMOE:
+            from mxmoe.vllm.experts import make_mxmoe_moe_quant_config
+
+            return make_mxmoe_moe_quant_config(
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                num_bits=self.num_bits,
+                group_size=self.group_size,
+                activation_plan=layer.mxmoe_activation_plan,
+            )
         if self.wna16_backend == WNA16MoEBackend.HUMMING:
             from vllm.model_executor.layers.quantization.utils.humming import (
                 get_humming_moe_quant_config,
