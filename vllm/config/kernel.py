@@ -131,6 +131,7 @@ MoEBackend = Literal[
     "flashinfer_moe_ep_mega_cutedsl",
     "marlin",
     "humming",
+    "scalingmoe",
     "triton_unfused",
     "aiter",
     "aiter_triton_mxfp4_bf16",
@@ -264,6 +265,7 @@ class KernelConfig:
       requantized at load
     - "marlin": Use Marlin kernels (weight-only quantization)
     - "humming": Use Humming Mixed Precision kernels
+    - "scalingmoe": Use the experimental ScalingMoE zero-output grouped GEMM
     - "triton_unfused": Use Triton unfused MoE kernels
     - "aiter": Use AMD AITer kernels (ROCm only)
     - "aiter_triton_mxfp4_bf16": Use the AITER Triton MXFP4 W4A16

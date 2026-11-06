@@ -456,6 +456,10 @@ class FusedMoEPrepareAndFinalizeMonolithic(FusedMoEPrepareAndFinalize):
 
 # TODO: add supported activations method (return string)
 class FusedMoEExperts(ABC):
+    # Modular backends opt in to the router_logits keyword. Existing experts
+    # keep their apply signatures; no logits are copied or stored on the layer.
+    requires_router_logits: bool = False
+
     # ROCm AITER kernels consume a 0/1 local-expert mask (with a trailing
     # sentinel slot); every other backend consumes the canonical -1/local-slot
     # expert_map. RoutedExperts.expert_map reads this flag to pick which to hand
@@ -1280,6 +1284,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool,
         expert_tokens_meta: ExpertTokensMetadata | None,
         output_alias: torch.Tensor | None = None,
+        router_logits: torch.Tensor | None = None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
@@ -1328,6 +1333,12 @@ class FusedMoEKernelModularImpl:
         elif use_output_alias:
             fused_out = output_alias
 
+        router_kwargs = {}
+        if router_logits is not None:
+            if not self.fused_experts.requires_router_logits:
+                raise ValueError("This MoE backend does not consume raw router logits")
+            router_kwargs["router_logits"] = router_logits
+
         unfinalized = self.fused_experts.apply(
             output=fused_out,
             hidden_states=a1q,
@@ -1344,6 +1355,7 @@ class FusedMoEKernelModularImpl:
             workspace2=workspace2,
             expert_tokens_meta=expert_tokens_meta,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            **router_kwargs,
         )
 
         # Experts that stopped after GEMM2 wrote nothing into `fused_out`; the
@@ -1441,6 +1453,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool = False,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        router_logits: torch.Tensor | None = None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         """This function computes a Mixture of Experts (MoE) layer using two sets
         of weights, w1 and w2, and top-k gating mechanism.
@@ -1466,6 +1479,8 @@ class FusedMoEKernelModularImpl:
             shared_experts_input (Optional[torch.Tensor]): Optional separate
                 input for shared experts. For latent MoE, this is the original
                 hidden_states before latent projection.
+            router_logits: Optional original [tokens, experts] gate output.
+                Only supported when preparation preserves local token order.
 
         Returns:
             torch.Tensor: The output tensor after applying the MoE layer, or
@@ -1473,6 +1488,17 @@ class FusedMoEKernelModularImpl:
             a fused consumer.
 
         """
+        if router_logits is not None and (
+            self.is_dp_ep
+            or self.prepare_finalize.activation_format
+            != FusedMoEActivationFormat.Standard
+        ):
+            raise ValueError(
+                "Raw router logits require the standard local token layout"
+            )
+        router_kwargs = (
+            {} if router_logits is None else {"router_logits": router_logits}
+        )
         output = torch.empty_like(hidden_states)
 
         local_num_experts = w1.shape[0]
@@ -1510,6 +1536,7 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input=apply_router_weight_on_input,
             expert_tokens_meta=expert_tokens_meta,
             output_alias=output,
+            **router_kwargs,
         )
 
         if lora_ctx is not None:
@@ -1728,8 +1755,12 @@ class FusedMoEKernel:
         apply_router_weight_on_input: bool,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        router_logits: torch.Tensor | None = None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
+        router_kwargs = (
+            {} if router_logits is None else {"router_logits": router_logits}
+        )
         return self.impl.apply(
             hidden_states=hidden_states,
             w1=w1,
@@ -1742,4 +1773,5 @@ class FusedMoEKernel:
             apply_router_weight_on_input=apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            **router_kwargs,
         )

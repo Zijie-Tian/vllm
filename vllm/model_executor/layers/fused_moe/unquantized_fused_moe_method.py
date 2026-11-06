@@ -288,7 +288,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
+        router_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        router_kwargs = (
+            {} if router_logits is None else {"router_logits": router_logits}
+        )
         return self.forward(
             layer=layer,
             x=x,
@@ -296,6 +300,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             topk_ids=topk_ids,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            **router_kwargs,
         )
 
     def forward_native(
@@ -306,8 +311,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
+        router_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
+        router_kwargs = (
+            {} if router_logits is None else {"router_logits": router_logits}
+        )
         return self.moe_kernel.apply(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -320,6 +329,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             expert_map=layer.expert_map,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            **router_kwargs,
         )
 
     def forward_cuda(
@@ -330,7 +340,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
+        router_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        router_kwargs = (
+            {} if router_logits is None else {"router_logits": router_logits}
+        )
         return self.forward_native(
             layer,
             x,
@@ -338,6 +352,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             topk_ids,
             shared_experts,
             shared_experts_input,
+            **router_kwargs,
         )
 
     def apply_monolithic(

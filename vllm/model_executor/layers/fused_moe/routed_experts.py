@@ -1254,6 +1254,7 @@ class RoutedExperts(PluggableLayer):
         topk_ids: torch.Tensor,
         shared_experts: "SharedExperts | None" = None,
         shared_experts_input: torch.Tensor | None = None,
+        router_logits: torch.Tensor | None = None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         """Execute routed experts using the quantization method's apply function.
 
@@ -1267,6 +1268,7 @@ class RoutedExperts(PluggableLayer):
             topk_ids: Selected expert IDs from router (for modular kernels)
             shared_experts: The shared experts (if any)
             shared_experts_input: Input for shared experts (if any)
+            router_logits: Original pre-TopK scores for an opted-in backend.
 
         Returns:
             Finalized routed states or a deferred-finalize output.
@@ -1275,6 +1277,9 @@ class RoutedExperts(PluggableLayer):
         assert not self.quant_method.is_monolithic
 
         # Modular kernels use pre-computed routing
+        router_kwargs = (
+            {} if router_logits is None else {"router_logits": router_logits}
+        )
         return self.quant_method.apply(
             layer=self,
             x=x,
@@ -1282,6 +1287,7 @@ class RoutedExperts(PluggableLayer):
             topk_ids=topk_ids,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            **router_kwargs,
         )
 
     def forward_monolithic(

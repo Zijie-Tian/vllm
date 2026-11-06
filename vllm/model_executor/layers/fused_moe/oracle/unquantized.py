@@ -45,6 +45,7 @@ class UnquantizedMoeBackend(Enum):
     XPU = "XPU"
     TPU = "TPU"
     OOT = "OOT"
+    SCALINGMOE = "SCALINGMOE"
 
 
 def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBackend]:
@@ -173,6 +174,13 @@ def backend_to_kernel_cls(
             CPUUnquantizedExperts,
         ]
 
+    elif backend == UnquantizedMoeBackend.SCALINGMOE:
+        from vllm.model_executor.layers.fused_moe.experts.scalingmoe import (
+            ScalingMoEExperts,
+        )
+
+        return [ScalingMoEExperts]
+
     else:
         raise ValueError(f"Unknown unquantized MoE backend: {backend.value}")
 
@@ -185,6 +193,7 @@ def map_unquantized_backend(runner_backend: MoEBackend) -> UnquantizedMoeBackend
         "flashinfer_trtllm": UnquantizedMoeBackend.FLASHINFER_TRTLLM,
         "flashinfer_cutlass": UnquantizedMoeBackend.FLASHINFER_CUTLASS,
         "aiter": UnquantizedMoeBackend.AITER,
+        "scalingmoe": UnquantizedMoeBackend.SCALINGMOE,
     }
     if backend := mapping.get(runner_backend):
         return backend

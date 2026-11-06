@@ -630,12 +630,18 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
+            router_kwargs = {}
+            kernel = self._quant_method.moe_kernel
+            if kernel is not None and kernel.fused_experts.requires_router_logits:
+                router_kwargs["router_logits"] = router_logits
+
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 shared_experts=self._shared_experts,
                 shared_experts_input=shared_experts_input,
+                **router_kwargs,
             )
 
         if shared_experts_overlapping:
