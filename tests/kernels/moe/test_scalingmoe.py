@@ -486,4 +486,3 @@ def test_scalingmoe_real_pipeline_returns_zero(dtype, use_graph) -> None:
             assert scratch.expert_first_token_offset.cpu().tolist() == [0, 0, 3, 4]
     finally:
         reset_workspace_manager()
-
