@@ -68,12 +68,19 @@ def prepare_humming_linear_layer_config(
         transform_humming_tensors,
     )
 
-    weight_schema = BaseWeightSchema.from_config(quant_config)
+    allow_fallback = True
+    if input_quant_config is not None:
+        # Copy first: the same dict may be reused, and from_config ignores
+        # allow_fallback. Group-wise W8 otherwise silently becomes W8A16.
+        input_quant_config = dict(input_quant_config)
+        allow_fallback = bool(input_quant_config.pop("allow_fallback", True))
     if input_schema is None:
         if input_quant_config is not None:
             input_schema = BaseInputSchema.from_config(input_quant_config)
         else:
             input_schema = HummingInputSchema()
+
+    weight_schema = BaseWeightSchema.from_config(quant_config)
 
     # ReplicatedLinear has no TP partitioning and so does not set
     # input_size_per_partition; for it that is just input_size. Use hasattr
@@ -120,6 +127,7 @@ def prepare_humming_linear_layer_config(
         weight_schema=weight_schema,
         input_schema=input_schema,
         param_dtype=layer.params_dtype,
+        allow_fallback=allow_fallback,
     )
     for name in ("input_scale", "input_scale_2"):
         if name != input_schema.static_tensor_scale_name:
