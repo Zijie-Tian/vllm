@@ -132,6 +132,7 @@ MoEBackend = Literal[
     "marlin",
     "humming",
     "scalingmoe",
+    "dxmoe",
     "triton_unfused",
     "aiter",
     "aiter_triton_mxfp4_bf16",

@@ -373,6 +373,8 @@ def get_quant_config(
     quant_config_file = quant_config_files[0]
     with open(quant_config_file) as f:
         config = json.load(f)
+        if model_config.quantization == "dxmoe" and isinstance(config, dict):
+            config.setdefault("_model_dir", hf_folder)
 
         if model_config.quantization in ("modelopt", "modelopt_mixed"):
             if config.get("producer", {}).get("name") == "modelopt":
@@ -580,7 +582,24 @@ def filter_duplicate_safetensors_files(
     # torch state_dict to safetensors file holding that weight.
     index_file_name = os.path.join(hf_folder, index_file)
     if not os.path.isfile(index_file_name):
-        return hf_weights_files
+        excluded_sidecars = {"dxmoe_signs.safetensors"}
+        dxmoe_meta_file = os.path.join(hf_folder, "dxmoe_meta.json")
+        if os.path.isfile(dxmoe_meta_file):
+            try:
+                with open(dxmoe_meta_file) as mf:
+                    signs_file = (
+                        json.load(mf).get("hadamard", {}).get("signs_file")
+                    )
+                if isinstance(signs_file, str) and signs_file.strip():
+                    excluded_sidecars.add(os.path.basename(signs_file))
+            except Exception:
+                pass
+        filtered = [
+            f
+            for f in hf_weights_files
+            if os.path.basename(f) not in excluded_sidecars
+        ]
+        return filtered if filtered else hf_weights_files
 
     # Iterate through the weight_map (weight_name: safetensors files)
     # to identify weights that we should use.

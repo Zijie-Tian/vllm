@@ -1366,10 +1366,11 @@ class ModelConfig:
                 "gpt_oss_mxfp4",
                 "deepseek_v4_fp8",
                 "humming",
+                "dxmoe",
             ]
-            # if the user specifies humming, we should always use humming
-            if self.quantization == "humming":
-                overrides = ["humming"] + overrides
+            # if the user specifies humming or dxmoe, we should always use it
+            if self.quantization in ("humming", "dxmoe"):
+                overrides = [self.quantization] + overrides
             quantization_methods = [
                 q for q in supported_quantization if q not in overrides
             ]
