@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import threading
+import weakref
 
 import torch
 
@@ -19,10 +20,18 @@ from vllm.v1.worker.workspace import (
     is_workspace_manager_initialized,
 )
 
-DXMOE_ABI_VERSION = 11
+DXMOE_ABI_VERSION = 12
 DXMOE_SHORT_MAX_TOKENS = 1024
 _TASK_COLUMNS = 11
 _COUNTS_LEN = 8
+
+DXMOE_STATUS_MESSAGES: dict[int, str] = {
+    2: "expert_ids out of range or activation_bits not in {4, 8, 16}",
+    3: "unsupported precision pair W8A4 (DxMoE coupling forbids W8 in the A4 pool)",
+    4: "DxMoE tile count exceeds int32",
+    5: "input activations must be finite",
+    6: "FP16 A16 pool cast overflowed finite range",
+}
 
 DTYPE_CODE: dict[torch.dtype, int] = {
     torch.float16: 0,
@@ -73,6 +82,7 @@ class NativeReorderDesc(ctypes.Structure):
         ("tasks", ctypes.c_int64),
         ("counts", ctypes.c_int64),
         ("status", ctypes.c_int64),
+        ("is_padding", ctypes.c_int64),
         ("num_tokens", ctypes.c_int32),
         ("topk", ctypes.c_int32),
         ("num_experts", ctypes.c_int32),
@@ -83,6 +93,8 @@ class NativeReorderDesc(ctypes.Structure):
         ("a16_dtype", ctypes.c_int32),
         ("group_size", ctypes.c_int32),
         ("compact_outputs", ctypes.c_int32),
+        ("num_valid_tokens", ctypes.c_int32),
+        ("preserve_prior_status", ctypes.c_int32),
     ]
 
 
@@ -100,6 +112,7 @@ class NativeOmegaDesc(ctypes.Structure):
         ("sink_tokens", ctypes.c_int32),
         ("local_window", ctypes.c_int32),
         ("mask_past_seq_end", ctypes.c_int32),
+        ("pos_dtype", ctypes.c_int32),
     ]
 
 
@@ -121,6 +134,7 @@ class NativePolicyDesc(ctypes.Structure):
         ("out_activation_bits", ctypes.c_int64),
         ("out_scores", ctypes.c_int64),
         ("out_w8_hits", ctypes.c_int64),
+        ("is_padding", ctypes.c_int64),
         ("tau1", ctypes.c_double),
         ("tau2", ctypes.c_double),
         ("scalar_omega", ctypes.c_float),
@@ -135,6 +149,7 @@ class NativePolicyDesc(ctypes.Structure):
         ("x_in_dtype", ctypes.c_int32),
         ("x_out_dtype", ctypes.c_int32),
         ("routing_dtype", ctypes.c_int32),
+        ("num_valid_tokens", ctypes.c_int32),
     ]
 
 
@@ -145,6 +160,8 @@ class NativeUnpermuteDesc(ctypes.Structure):
         ("routing_weights", ctypes.c_int64),
         ("is_padding", ctypes.c_int64),
         ("out", ctypes.c_int64),
+        ("status", ctypes.c_int64),
+        ("sticky_status", ctypes.c_int64),
         ("num_tokens", ctypes.c_int32),
         ("num_valid_tokens", ctypes.c_int32),
         ("topk", ctypes.c_int32),
@@ -336,7 +353,14 @@ def pack_dxmoe_weight_channel(
     weight_3d: torch.Tensor,
     w_bits_list: Sequence[int],
 ) -> DxMoELayerWeights:
-    """Pack reconstructed symmetric G=-1 float weights `[E, N, K]` to ABI 11 W4/W8."""
+    """Refit and pack reconstructed symmetric G=-1 float weights `[E, N, K]` to ABI 12 W4/W8.
+
+    Note: Standard HF DxMoE exports store dequantized FP16/BF16 weights (`safetensors`)
+    without raw integer codes or FP32 channel scales. This function executes a
+    multi-candidate grid search plus least-squares FP16 scale refit per output channel
+    to reconstruct `uint8` W4/W8 codes and `float16` channel scales (not a bit-lossless
+    recovery of the offline quantizer's internal integer state).
+    """
     if weight_3d.ndim != 3:
         raise ValueError(f"Expected 3D MoE weight [E, N, K], got {tuple(weight_3d.shape)}")
     num_experts, n, k = (
@@ -486,6 +510,11 @@ class DxMoESharedWorkspace:
         self.entry_amax = torch.empty((t_max,), dtype=torch.float32, device=device)
         self.entry_bits = torch.empty((c_max,), dtype=torch.int32, device=device)
 
+        # Note on BF16 model activations: SM80/SM86 DxMoE Tensor Core MMA tiles consume
+        # `pool_a16` in FP16 and emit `gate_up_compact` / `down_compact` in FP16 (with FP32
+        # MMA accumulation), before `weighted_unpermute` accumulates in FP32 and casts back
+        # to the model's output dtype (FP16 or BF16). BF16 A16 rows therefore undergo an
+        # FP16 pool conversion rather than raw BF16 passthrough.
         self.gate_up_compact = torch.empty(
             (c_max, 2 * self.inter_size), dtype=torch.float16, device=device
         )
@@ -518,6 +547,7 @@ class DxMoESharedWorkspace:
         )
         self.counts = torch.empty((_COUNTS_LEN,), dtype=torch.int32, device=device)
         self.status = torch.zeros((1,), dtype=torch.int32, device=device)
+        self.sticky_status = torch.zeros((1,), dtype=torch.int32, device=device)
         ws_bytes = bundle.reorder_workspace_bytes(t_max, self.topk, self.num_experts)
         self.reorder_ws = torch.empty((ws_bytes,), dtype=torch.uint8, device=device)
 
@@ -547,8 +577,65 @@ class DxMoESharedWorkspace:
             ctypes.c_int64 * 3
         )(int(self.down_compact.data_ptr()), 0, 0)
 
+        dev_idx = 0 if device.index is None else int(device.index)
+        with _WORKSPACE_LOCK:
+            _ACTIVE_WORKSPACES_BY_DEVICE.setdefault(dev_idx, []).append(
+                weakref.ref(self)
+            )
 
+    def assert_healthy_and_reset(self) -> None:
+        """Synchronize sticky_status outside CUDA Graph capture and raise on latched error."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "DxMoESharedWorkspace.assert_healthy_and_reset() must run outside CUDA Graph capture"
+            )
+        code = int(self.sticky_status.item())
+        if code != 0:
+            self.sticky_status.zero_()
+            self.status.zero_()
+            detail = DXMOE_STATUS_MESSAGES.get(code, f"native status code {code}")
+            raise RuntimeError(
+                f"DxMoE native operator latched error status={code}: {detail}"
+            )
+
+
+_WORKSPACE_LOCK = threading.Lock()
+_ACTIVE_WORKSPACES_BY_DEVICE: dict[int, list[weakref.ReferenceType[DxMoESharedWorkspace]]] = {}
 _FALLBACK_WORKSPACES: dict[tuple[object, ...], DxMoESharedWorkspace] = {}
+
+
+def check_dxmoe_workspaces_healthy(device: torch.device | int | None = None) -> None:
+    """Zero-overhead post-step health check; no-op when DxMoE is inactive or capturing."""
+    if not _ACTIVE_WORKSPACES_BY_DEVICE or torch.cuda.is_current_stream_capturing():
+        return
+    if device is None:
+        dev_indices = list(_ACTIVE_WORKSPACES_BY_DEVICE.keys())
+    elif isinstance(device, int):
+        dev_indices = [device]
+    elif device.type == "cuda":
+        dev_indices = [0 if device.index is None else int(device.index)]
+    else:
+        return
+
+    live_workspaces: list[DxMoESharedWorkspace] = []
+    with _WORKSPACE_LOCK:
+        for idx in dev_indices:
+            refs = _ACTIVE_WORKSPACES_BY_DEVICE.get(idx)
+            if not refs:
+                continue
+            kept: list[weakref.ReferenceType[DxMoESharedWorkspace]] = []
+            for ref in refs:
+                ws = ref()
+                if ws is not None:
+                    kept.append(ref)
+                    live_workspaces.append(ws)
+            if kept:
+                _ACTIVE_WORKSPACES_BY_DEVICE[idx] = kept
+            else:
+                _ACTIVE_WORKSPACES_BY_DEVICE.pop(idx, None)
+
+    for ws in live_workspaces:
+        ws.assert_healthy_and_reset()
 
 
 def get_dxmoe_shared_workspace(

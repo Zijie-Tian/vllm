@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -23,18 +24,17 @@ from vllm.model_executor.layers.fused_moe import (
     RoutedExperts,
     SharedExperts,
 )
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
     maybe_make_prepare_finalize,
 )
+from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.experts.dxmoe_experts import (
     DxMoEExperts,
     DxMoELayerRuntimeState,
     DxMoEMoEQuantConfig,
 )
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
-    UnquantizedFusedMoEMethod,
-)
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
@@ -46,6 +46,7 @@ from vllm.model_executor.utils import (
     replace_parameter,
     set_weight_attrs,
 )
+from vllm.platforms import current_platform
 from vllm.utils.dxmoe import (
     PIPELINED_CODE,
     SCHEDULE_MODE_CODE,
@@ -58,9 +59,16 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _DXMOE_META_FORMAT = "scaling-moe.dxmoe.meta"
+_DXMOE_THRESHOLDS_FORMAT = "scaling-moe.dxmoe.thresholds"
 _DXMOE_META_FILENAME = "dxmoe_meta.json"
 _DXMOE_SIGNS_FILENAME = "dxmoe_signs.safetensors"
 _LAYER_IDX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+_SUPPORTED_SM_CAPS = ((8, 0), (8, 6))
+_SUPPORTED_ROUTING_METHODS = (
+    RoutingMethodType.Default,
+    RoutingMethodType.RenormalizeNaive,
+    RoutingMethodType.Renormalize,
+)
 
 
 @dataclass(frozen=True)
@@ -189,7 +197,57 @@ class DxMoEConfig(QuantizationConfig):
                 return candidate
         return None
 
+    def _validate_deployment_config(self) -> None:
+        vllm_cfg = get_current_vllm_config_or_none()
+        if vllm_cfg is not None:
+            p_cfg = getattr(vllm_cfg, "parallel_config", None)
+            if p_cfg is not None:
+                tp = int(getattr(p_cfg, "tensor_parallel_size", 1))
+                pp = int(getattr(p_cfg, "pipeline_parallel_size", 1))
+                dp = int(getattr(p_cfg, "data_parallel_size", 1))
+                pcp = int(getattr(p_cfg, "prefill_context_parallel_size", 1))
+                use_ep = bool(getattr(p_cfg, "enable_expert_parallel", False))
+                enable_eplb = bool(getattr(p_cfg, "enable_eplb", False))
+                if (
+                    tp != 1
+                    or pp != 1
+                    or dp != 1
+                    or pcp != 1
+                    or use_ep
+                    or enable_eplb
+                ):
+                    raise ValueError(
+                        "DxMoE requires single-GPU execution "
+                        "(tp=pp=dp=ep=pcp=1, enable_expert_parallel=False, enable_eplb=False), "
+                        f"got tp={tp}, pp={pp}, dp={dp}, pcp={pcp}, "
+                        f"use_ep={use_ep}, enable_eplb={enable_eplb}."
+                    )
+            s_cfg = getattr(vllm_cfg, "scheduler_config", None)
+            if s_cfg is not None and int(getattr(s_cfg, "max_num_seqs", 1)) != 1:
+                raise ValueError(
+                    "DxMoE vLLM backend supports single-request B=1 execution only "
+                    f"(expected scheduler_config.max_num_seqs == 1, got "
+                    f"{s_cfg.max_num_seqs}); pass max_num_seqs=1."
+                )
+            k_cfg = getattr(vllm_cfg, "kernel_config", None)
+            if k_cfg is not None:
+                moe_backend = getattr(k_cfg, "moe_backend", "auto")
+                if moe_backend not in ("auto", "dxmoe"):
+                    raise ValueError(
+                        f"DxMoE quantization requires moe_backend in ('auto', 'dxmoe'), "
+                        f"got {moe_backend!r}."
+                    )
+
+        if torch.cuda.is_available():
+            cap = current_platform.get_device_capability()
+            if cap is None or (int(cap[0]), int(cap[1])) not in _SUPPORTED_SM_CAPS:
+                raise ValueError(
+                    "DxMoE native CUDA operator supports SM80 and SM86 only, "
+                    f"got device capability {cap!r}."
+                )
+
     def _ensure_resolved(self) -> dict[int, _ParsedDxMoELayerSpec]:
+        self._validate_deployment_config()
         if self._resolved_specs is not None:
             return self._resolved_specs
 
@@ -243,7 +301,22 @@ class DxMoEConfig(QuantizationConfig):
         external_thresholds: dict[str, Any] | None = None
         if thresholds_json_raw:
             ext_doc = json.loads(Path(str(thresholds_json_raw)).read_text(encoding="utf-8"))
-            external_thresholds = ext_doc.get("layers", ext_doc)
+            if not isinstance(ext_doc, dict):
+                raise ValueError("External DxMoE thresholds JSON must be a JSON object")
+            if "format" in ext_doc or "version" in ext_doc:
+                if (
+                    ext_doc.get("format") != _DXMOE_THRESHOLDS_FORMAT
+                    or ext_doc.get("version") != 1
+                ):
+                    raise ValueError(
+                        f"Expected thresholds JSON format={_DXMOE_THRESHOLDS_FORMAT!r} "
+                        f"version=1, got format={ext_doc.get('format')!r} "
+                        f"version={ext_doc.get('version')!r}"
+                    )
+            ext_layers = ext_doc.get("layers", ext_doc)
+            if not isinstance(ext_layers, dict):
+                raise ValueError("External DxMoE thresholds 'layers' must be a JSON object")
+            external_thresholds = ext_layers
 
         raw_pipelined = (
             os.environ.get("VLLM_DXMOE_PIPELINED")
@@ -263,12 +336,18 @@ class DxMoEConfig(QuantizationConfig):
         use_omega = bool(_parse_bool_env("VLLM_DXMOE_USE_OMEGA", bool(cfg_use_omega)))
         sink_tokens = int(
             os.environ.get("VLLM_DXMOE_SINK_TOKENS")
-            or self.raw_config.get("sink_tokens", 4)
+            if os.environ.get("VLLM_DXMOE_SINK_TOKENS") is not None
+            else self.raw_config.get("sink_tokens", 4)
         )
         local_window = int(
             os.environ.get("VLLM_DXMOE_LOCAL_WINDOW")
-            or self.raw_config.get("local_window", 32)
+            if os.environ.get("VLLM_DXMOE_LOCAL_WINDOW") is not None
+            else self.raw_config.get("local_window", 32)
         )
+        if sink_tokens < 0 or local_window < 0:
+            raise ValueError(
+                f"sink_tokens and local_window must be non-negative, got {(sink_tokens, local_window)}"
+            )
         raw_coupling = _parse_bool_env(
             "VLLM_DXMOE_APPLY_COUPLING", self.raw_config.get("apply_coupling")
         )
@@ -333,19 +412,23 @@ class DxMoEConfig(QuantizationConfig):
                     )
                 w_bits_entry.append(bw_e)
                 w_bits_down.append(bw_d)
-                beta_entry.append(float(ed["entry"]["beta"]))
-                beta_down.append(float(ed["down"]["beta"]))
+                be = float(ed["entry"]["beta"])
+                bd = float(ed["down"]["beta"])
+                if not (
+                    math.isfinite(be)
+                    and be >= 0.0
+                    and math.isfinite(bd)
+                    and bd >= 0.0
+                ):
+                    raise ValueError(
+                        f"Layer {l_idx} expert {e_idx} beta must be finite and "
+                        f"non-negative, got entry={be!r}, down={bd!r}"
+                    )
+                beta_entry.append(be)
+                beta_down.append(bd)
 
             has_w8_entry = any(b == 8 for b in w_bits_entry)
             has_w8_down = any(b == 8 for b in w_bits_down)
-            if raw_coupling is False and schedule_mode == "static_a4" and (
-                has_w8_entry or has_w8_down
-            ):
-                raise ValueError(
-                    f"Layer {l_idx} contains W8 experts, which cannot execute "
-                    "schedule_mode='static_a4' with apply_coupling=False (W8A4 is "
-                    "forbidden by the native DxMoE kernel)."
-                )
             if raw_coupling is not None:
                 coup_entry = raw_coupling
                 coup_down = raw_coupling
@@ -353,22 +436,51 @@ class DxMoEConfig(QuantizationConfig):
                 coup_entry = schedule_mode in ("dxmoe", "static_a4")
                 coup_down = schedule_mode in ("dxmoe", "static_a4")
 
-            t_map = (
-                external_thresholds.get(l_str, {})
-                if external_thresholds is not None
-                else l_meta.get("thresholds", {})
-            )
+            if external_thresholds is not None:
+                if l_str not in external_thresholds:
+                    raise ValueError(
+                        f"External thresholds JSON missing layer {l_idx}; "
+                        f"available layers: {sorted(external_thresholds)}"
+                    )
+                layer_ext = external_thresholds[l_str]
+                if not isinstance(layer_ext, dict):
+                    raise ValueError(
+                        f"External thresholds entry for layer {l_idx} must be a dict"
+                    )
+                t_map = layer_ext.get("thresholds", layer_ext)
+            else:
+                t_map = l_meta.get("thresholds", {})
+            if not isinstance(t_map, dict):
+                raise ValueError(f"Layer {l_idx} thresholds mapping must be a dict")
             if threshold_key in t_map:
                 tdoc = t_map[threshold_key]
                 raw_te = tdoc.get("tau_entry", tdoc.get("tau"))
                 raw_td = tdoc.get("tau_down", tdoc.get("tau"))
-                if raw_te is None or raw_td is None:
+                if (
+                    raw_te is None
+                    or raw_td is None
+                    or len(raw_te) != 2
+                    or len(raw_td) != 2
+                ):
                     raise ValueError(
                         f"Layer {l_idx} threshold_key={threshold_key!r} missing "
-                        "tau_entry/tau_down"
+                        "2-element tau_entry/tau_down"
                     )
                 tau_entry = (float(raw_te[0]), float(raw_te[1]))
                 tau_down = (float(raw_td[0]), float(raw_td[1]))
+                for stage_name, (t0, t1) in (
+                    ("tau_entry", tau_entry),
+                    ("tau_down", tau_down),
+                ):
+                    if not (
+                        math.isfinite(t0)
+                        and math.isfinite(t1)
+                        and 0.0 <= t0 <= t1
+                    ):
+                        raise ValueError(
+                            f"Layer {l_idx} invalid {stage_name}={(t0, t1)}; "
+                            "expected finite 0 <= tau1 <= tau2"
+                        )
             elif schedule_mode == "dxmoe":
                 raise ValueError(
                     f"schedule_mode='dxmoe' requires calibrated thresholds under "
@@ -378,6 +490,24 @@ class DxMoEConfig(QuantizationConfig):
             else:
                 tau_entry = (0.0, 0.0)
                 tau_down = (0.0, 0.0)
+
+            if raw_coupling is False:
+                if schedule_mode == "static_a4" and (has_w8_entry or has_w8_down):
+                    raise ValueError(
+                        f"Layer {l_idx} contains W8 experts, which cannot execute "
+                        "schedule_mode='static_a4' with apply_coupling=False "
+                        "(W8A4 is forbidden by the native DxMoE kernel)."
+                    )
+                if schedule_mode == "dxmoe" and (
+                    (has_w8_entry and tau_entry[0] > 0.0)
+                    or (has_w8_down and tau_down[0] > 0.0)
+                ):
+                    raise ValueError(
+                        f"Layer {l_idx} contains W8 experts with positive A4 threshold "
+                        f"(tau_entry={tau_entry}, tau_down={tau_down}); "
+                        "apply_coupling=False is forbidden under schedule_mode='dxmoe' "
+                        "because it can select W8A4."
+                    )
 
             s_in_cpu, s_mid_cpu = signs_by_layer.get(l_idx, (None, None))
             if s_in_cpu is not None and s_in_cpu.numel() != hidden_size:
@@ -431,17 +561,23 @@ class DxMoEConfig(QuantizationConfig):
         if isinstance(layer, RoutedExperts):
             specs = self._ensure_resolved()
             m = _LAYER_IDX_RE.search(prefix)
-            if m is not None:
-                l_idx = int(m.group(1))
-                spec = specs.get(l_idx)
-                if spec is not None:
-                    return DxMoEMoEMethod(spec, layer.moe_config)
-            return UnquantizedFusedMoEMethod(layer.moe_config)
+            if m is None:
+                raise ValueError(
+                    f"DxMoE cannot parse layer index from RoutedExperts prefix {prefix!r}"
+                )
+            l_idx = int(m.group(1))
+            spec = specs.get(l_idx)
+            if spec is None:
+                raise ValueError(
+                    f"DxMoE metadata ({_DXMOE_META_FILENAME}) is missing RoutedExperts "
+                    f"layer {l_idx} (prefix={prefix!r}); available layers: {sorted(specs)}"
+                )
+            return DxMoEMoEMethod(spec, layer.moe_config)
         return None
 
 
 class DxMoEMoEMethod(FusedMoEMethodBase):
-    """FusedMoE method loading standard float MoE weights and packing to DxMoE W4/W8."""
+    """FusedMoE method loading reconstructed float MoE weights and refitting to DxMoE W4/W8."""
 
     def __init__(self, layer_spec: _ParsedDxMoELayerSpec, moe: FusedMoEConfig) -> None:
         super().__init__(moe)
@@ -453,6 +589,84 @@ class DxMoEMoEMethod(FusedMoEMethodBase):
     def supports_eplb(self) -> bool:
         return False
 
+    def _validate_layer_contract(self, layer: RoutedExperts) -> None:
+        spec = self.layer_spec
+        if self.moe.moe_backend not in ("auto", "dxmoe"):
+            raise ValueError(
+                f"DxMoEMoEMethod requires moe_backend in ('auto', 'dxmoe'), "
+                f"got {self.moe.moe_backend!r}"
+            )
+        p_cfg = self.moe.moe_parallel_config
+        if (
+            self.moe.tp_size != 1
+            or self.moe.dp_size != 1
+            or self.moe.ep_size != 1
+            or self.moe.use_ep
+            or p_cfg.enable_eplb
+        ):
+            raise ValueError(
+                "DxMoEMoEMethod requires single-GPU TP=1, DP=1, EP=1 execution "
+                "with enable_eplb=False."
+            )
+        if self.moe.has_bias:
+            raise ValueError("DxMoEMoEMethod does not support biased MoE layers.")
+        if (
+            not self.moe.is_act_and_mul
+            or self.moe.activation != MoEActivation.SILU
+            or self.moe.swiglu_limit is not None
+        ):
+            raise ValueError(
+                "DxMoEMoEMethod requires unclamped gated SiLU-and-mul (SwiGLU) MoE layers, "
+                f"got activation={self.moe.activation!r}, "
+                f"swiglu_limit={self.moe.swiglu_limit!r}."
+            )
+        if (
+            self.moe.experts_per_token != spec.top_k
+            or getattr(layer, "top_k", spec.top_k) != spec.top_k
+        ):
+            raise ValueError(
+                f"Layer {spec.layer_idx} top_k mismatch between vLLM RoutedExperts "
+                f"(experts_per_token={self.moe.experts_per_token}, "
+                f"layer.top_k={getattr(layer, 'top_k', None)}) and "
+                f"dxmoe_meta.json (top_k={spec.top_k})."
+            )
+        scoring_func = getattr(layer, "scoring_func", "softmax")
+        use_grouped_topk = bool(getattr(layer, "use_grouped_topk", False))
+        num_expert_group = getattr(layer, "num_expert_group", None)
+        topk_group = getattr(layer, "topk_group", None)
+        # DeepseekV2MoE always sets `use_grouped_topk=True`, which `router_factory`
+        # degenerates to standard ungrouped `FusedTopKRouter` when
+        # `num_expert_group <= 1 and topk_group <= 1` (e.g. DeepSeek-V2-Lite).
+        nondegenerate_grouped_topk = (
+            (num_expert_group is not None and int(num_expert_group) > 1)
+            or (topk_group is not None and int(topk_group) > 1)
+            or (
+                use_grouped_topk
+                and (num_expert_group is None or topk_group is None)
+            )
+        )
+        e_bias = getattr(layer, "e_score_correction_bias", None)
+        custom_fn = getattr(layer, "custom_routing_function", None)
+        apply_on_in = bool(getattr(layer, "apply_router_weight_on_input", False))
+        if (
+            scoring_func != "softmax"
+            or nondegenerate_grouped_topk
+            or e_bias is not None
+            or custom_fn is not None
+            or apply_on_in
+            or self.moe.has_hash_routing
+            or self.moe.routing_method not in _SUPPORTED_ROUTING_METHODS
+        ):
+            raise ValueError(
+                f"Layer {spec.layer_idx} uses unsupported MoE routing for DxMoE: "
+                "only standard unbiased, ungrouped global Softmax TopK is supported "
+                f"(got scoring_func={scoring_func!r}, use_grouped_topk={use_grouped_topk}, "
+                f"num_expert_group={num_expert_group!r}, topk_group={topk_group!r}, "
+                f"has_bias={e_bias is not None}, has_custom_router={custom_fn is not None}, "
+                f"apply_router_weight_on_input={apply_on_in}, "
+                f"routing_method={self.moe.routing_method!r})."
+            )
+
     def create_weights(
         self,
         layer: RoutedExperts,
@@ -462,14 +676,7 @@ class DxMoEMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs: Any,
     ) -> None:
-        if self.moe.tp_size != 1 or self.moe.ep_size != 1 or self.moe.use_ep:
-            raise NotImplementedError(
-                "DxMoEMoEMethod requires single-GPU TP=1, EP=1 execution."
-            )
-        if self.moe.has_bias:
-            raise NotImplementedError("DxMoEMoEMethod does not support biased MoE layers.")
-        if not self.moe.is_act_and_mul:
-            raise NotImplementedError("DxMoEMoEMethod requires gated SwiGLU MoE layers.")
+        self._validate_layer_contract(layer)
 
         spec = self.layer_spec
         if (
@@ -632,6 +839,7 @@ class DxMoEMoEMethod(FusedMoEMethodBase):
         shared_experts_input: torch.Tensor | None,
         router_logits: torch.Tensor | None = None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
+        self._validate_layer_contract(layer)
         assert self.moe_kernel is not None
         router_kwargs = (
             {} if router_logits is None else {"router_logits": router_logits}

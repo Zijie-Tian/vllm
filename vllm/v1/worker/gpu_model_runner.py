@@ -4417,6 +4417,8 @@ class GPUModelRunner(
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
                 is_padding=is_padding,
+                positions=positions,
+                seq_lens=self.seq_lens,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -4431,6 +4433,10 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        from vllm.utils.dxmoe import check_dxmoe_workspaces_healthy
+
+        check_dxmoe_workspaces_healthy(self.device)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -6114,6 +6120,8 @@ class GPUModelRunner(
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
                     is_padding=is_padding,
+                    positions=positions,
+                    seq_lens=self.seq_lens,
                 ),
             ):
                 outputs = self.model(

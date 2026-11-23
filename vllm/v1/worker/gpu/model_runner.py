@@ -1987,6 +1987,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
+                positions=input_batch.positions,
+                seq_lens=self.input_buffers.seq_lens,
             ):
                 self.kv_connector.pre_forward(**connector_kwargs)
                 if ubatch_state is not None:
@@ -2007,6 +2009,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        from vllm.utils.dxmoe import check_dxmoe_workspaces_healthy
+
+        check_dxmoe_workspaces_healthy(self.device)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
