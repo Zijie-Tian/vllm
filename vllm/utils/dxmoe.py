@@ -19,7 +19,7 @@ from vllm.v1.worker.workspace import (
     is_workspace_manager_initialized,
 )
 
-DXMOE_ABI_VERSION = 10
+DXMOE_ABI_VERSION = 11
 DXMOE_SHORT_MAX_TOKENS = 1024
 _TASK_COLUMNS = 11
 _COUNTS_LEN = 8
@@ -164,8 +164,21 @@ def _bind_dxmoe_dso(path: Path, expected_arch: int) -> ctypes.CDLL:
     lib = ctypes.CDLL(str(path))
     lib.smoe_dxmoe_abi_version.argtypes = []
     lib.smoe_dxmoe_abi_version.restype = ctypes.c_int
+    abi = int(lib.smoe_dxmoe_abi_version())
+    if abi != DXMOE_ABI_VERSION:
+        raise RuntimeError(
+            f"DxMoE ABI mismatch in {path}: expected {DXMOE_ABI_VERSION}, got {abi}"
+        )
+
     lib.smoe_dxmoe_arch.argtypes = []
     lib.smoe_dxmoe_arch.restype = ctypes.c_int
+    arch = int(lib.smoe_dxmoe_arch())
+    if arch != expected_arch:
+        raise RuntimeError(
+            f"DxMoE SM arch mismatch in {path}: library compiled for sm_{arch}, "
+            f"current GPU is sm_{expected_arch}"
+        )
+
     lib.smoe_dxmoe_prepare.argtypes = []
     lib.smoe_dxmoe_prepare.restype = ctypes.c_int
     lib.smoe_dxmoe_default_grid.argtypes = [
@@ -204,18 +217,6 @@ def _bind_dxmoe_dso(path: Path, expected_arch: int) -> ctypes.CDLL:
         ctypes.c_void_p,
     ]
     lib.smoe_dxmoe_weighted_unpermute.restype = ctypes.c_int
-
-    abi = int(lib.smoe_dxmoe_abi_version())
-    if abi != DXMOE_ABI_VERSION:
-        raise RuntimeError(
-            f"DxMoE ABI mismatch in {path}: expected {DXMOE_ABI_VERSION}, got {abi}"
-        )
-    arch = int(lib.smoe_dxmoe_arch())
-    if arch != expected_arch:
-        raise RuntimeError(
-            f"DxMoE SM arch mismatch in {path}: library compiled for sm_{arch}, "
-            f"current GPU is sm_{expected_arch}"
-        )
     return lib
 
 
@@ -335,7 +336,7 @@ def pack_dxmoe_weight_channel(
     weight_3d: torch.Tensor,
     w_bits_list: Sequence[int],
 ) -> DxMoELayerWeights:
-    """Pack reconstructed symmetric G=-1 float weights `[E, N, K]` to ABI 10 W4/W8."""
+    """Pack reconstructed symmetric G=-1 float weights `[E, N, K]` to ABI 11 W4/W8."""
     if weight_3d.ndim != 3:
         raise ValueError(f"Expected 3D MoE weight [E, N, K], got {tuple(weight_3d.shape)}")
     num_experts, n, k = (
@@ -349,7 +350,7 @@ def pack_dxmoe_weight_channel(
         )
     if n <= 0 or k <= 0 or n % 256 != 0 or k % 128 != 0:
         raise ValueError(
-            f"DxMoE ABI 10 requires N % 256 == 0 and K % 128 == 0, got N={n}, K={k}"
+            f"DxMoE ABI {DXMOE_ABI_VERSION} requires N % 256 == 0 and K % 128 == 0, got N={n}, K={k}"
         )
     bits_clean = [int(b) for b in w_bits_list]
     if any(b not in (4, 8) for b in bits_clean):
