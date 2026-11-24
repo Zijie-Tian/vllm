@@ -37,9 +37,16 @@ from vllm.model_executor.layers.fused_moe.experts.dxmoe_experts import (
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization.auto_gptq import (
+    AutoGPTQConfig,
+    AutoGPTQLinearMethod,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
+)
+from vllm.model_executor.layers.quantization.utils.gptq_utils import (
+    get_dynamic_override,
 )
 from vllm.model_executor.utils import (
     is_weights_pre_processed,
@@ -47,10 +54,16 @@ from vllm.model_executor.utils import (
     set_weight_attrs,
 )
 from vllm.platforms import current_platform
+from vllm.transformers_utils.config import get_safetensors_params_metadata
 from vllm.utils.dxmoe import (
     PIPELINED_CODE,
     SCHEDULE_MODE_CODE,
-    pack_dxmoe_weight_channel,
+    allocate_dxmoe_weight_buffers,
+    finalize_dxmoe_weight_channel,
+    pack_dxmoe_float_matrix,
+    repack_gptq_qweight_shard,
+    validate_gptq_qzeros_shard,
+    validate_gptq_scales_shard,
 )
 
 if TYPE_CHECKING:
@@ -149,6 +162,11 @@ class DxMoEConfig(QuantizationConfig):
         super().__init__()
         self.raw_config: dict[str, Any] = dict(raw_config or {})
         self._resolved_specs: dict[int, _ParsedDxMoELayerSpec] | None = None
+        self._checkpoint_meta_resolved: bool = False
+        self._safetensors_param_meta: dict[str, dict[str, Any]] = {}
+        self._hf_gptq_raw_cfg: dict[str, Any] | None = None
+        self._explicit_model_name: str | None = None
+        self._explicit_revision: str | None = None
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -182,7 +200,8 @@ class DxMoEConfig(QuantizationConfig):
 
     def _resolve_model_dir(self) -> Path | None:
         explicit = (
-            self.raw_config.get("_model_dir")
+            self._explicit_model_name
+            or self.raw_config.get("_model_dir")
             or self.raw_config.get("model_dir")
             or os.environ.get("VLLM_DXMOE_MODEL_DIR")
         )
@@ -196,6 +215,172 @@ class DxMoEConfig(QuantizationConfig):
             if candidate.is_dir():
                 return candidate
         return None
+
+    def maybe_update_config(
+        self,
+        model_name: str,
+        hf_config: Any = None,
+        revision: str | None = None,
+    ) -> None:
+        self._explicit_model_name = model_name
+        self._explicit_revision = revision
+        if hf_config is not None:
+            qcfg = getattr(hf_config, "quantization_config", None)
+            if isinstance(qcfg, dict) and str(qcfg.get("quant_method", "")).lower() == "gptq":
+                self._hf_gptq_raw_cfg = dict(qcfg)
+        self._ensure_checkpoint_metadata()
+
+    def _ensure_checkpoint_metadata(self) -> dict[str, dict[str, Any]]:
+        if self._checkpoint_meta_resolved:
+            return self._safetensors_param_meta
+        self._checkpoint_meta_resolved = True
+
+        if (
+            self._hf_gptq_raw_cfg is None
+            and str(self.raw_config.get("quant_method", "")).lower() == "gptq"
+        ):
+            self._hf_gptq_raw_cfg = dict(self.raw_config)
+
+        model_dir = self._resolve_model_dir()
+        if model_dir is None:
+            return self._safetensors_param_meta
+
+        cfg_json = model_dir / "config.json"
+        if self._hf_gptq_raw_cfg is None and cfg_json.is_file():
+            cfg_doc = json.loads(cfg_json.read_text(encoding="utf-8"))
+            qcfg = cfg_doc.get("quantization_config")
+            if isinstance(qcfg, dict) and str(qcfg.get("quant_method", "")).lower() == "gptq":
+                self._hf_gptq_raw_cfg = dict(qcfg)
+
+        has_safetensors = any(
+            p.is_file()
+            and p.suffix == ".safetensors"
+            and p.name != _DXMOE_SIGNS_FILENAME
+            for p in model_dir.iterdir()
+        )
+        if has_safetensors:
+            self._safetensors_param_meta = dict(
+                get_safetensors_params_metadata(
+                    str(model_dir), revision=self._explicit_revision
+                )
+            )
+        return self._safetensors_param_meta
+
+    def _resolve_linear_shard_prefixes(
+        self,
+        prefix: str,
+        param_meta: dict[str, dict[str, Any]],
+    ) -> list[str]:
+        if f"{prefix}.qweight" in param_meta or f"{prefix}.weight" in param_meta:
+            return [prefix]
+        proj_name = prefix.rsplit(".", 1)[-1]
+        fused_map: dict[str, list[str]] = {
+            "gate_up_proj": ["gate_proj", "up_proj"],
+            **self.packed_modules_mapping,
+        }
+        if proj_name in fused_map:
+            stem = prefix[: -len(proj_name)]
+            return [f"{stem}{shard_name}" for shard_name in fused_map[proj_name]]
+        return [prefix]
+
+    def _build_wna16_linear_method(
+        self,
+        prefix: str,
+        shard_prefixes: list[str],
+        param_meta: dict[str, dict[str, Any]],
+    ) -> AutoGPTQLinearMethod:
+        """Build a WNA16 (`input_dtype=None`) Marlin GPTQ linear method for quantized non-routed Linears."""
+        raw_qcfg = self._hf_gptq_raw_cfg or {}
+        dynamic_cfg = raw_qcfg.get("dynamic")
+        dynamic_dict = dict(dynamic_cfg) if isinstance(dynamic_cfg, dict) else {}
+
+        inferred_pairs: set[tuple[int, int]] = set()
+        for sp in shard_prefixes:
+            qw_info = param_meta.get(f"{sp}.qweight")
+            sc_info = param_meta.get(f"{sp}.scales")
+            qz_info = param_meta.get(f"{sp}.qzeros")
+            if qw_info is None or sc_info is None or qz_info is None:
+                raise ValueError(
+                    f"Incomplete GPTQ safetensors metadata for {sp!r} (expected .qweight, .scales, .qzeros)"
+                )
+            qw_shape = qw_info["shape"]
+            sc_shape = sc_info["shape"]
+            qz_shape = qz_info["shape"]
+            if (
+                len(qw_shape) != 2
+                or len(sc_shape) != 2
+                or len(qz_shape) != 2
+                or int(qz_shape[1]) <= 0
+                or int(qw_shape[1]) % int(qz_shape[1]) != 0
+            ):
+                raise ValueError(
+                    f"Invalid GPTQ tensor shapes for {sp!r}: qweight={qw_shape}, "
+                    f"scales={sc_shape}, qzeros={qz_shape}"
+                )
+            pack_factor = int(qw_shape[1]) // int(qz_shape[1])
+            if 32 % pack_factor != 0:
+                raise ValueError(f"Unsupported GPTQ pack_factor={pack_factor} on {sp!r}")
+            bits = 32 // pack_factor
+            k_full = int(qw_shape[0]) * pack_factor
+            num_groups = int(sc_shape[0])
+            if num_groups <= 0 or k_full % num_groups != 0:
+                raise ValueError(
+                    f"Invalid GPTQ scales num_groups={num_groups} for K={k_full} on {sp!r}"
+                )
+
+            cfg_gs = raw_qcfg.get("group_size")
+            if dynamic_dict:
+                dummy_holder = type("_Holder", (), {"dynamic": dynamic_dict})()
+                ov_gs = get_dynamic_override(dummy_holder, sp, "group_size", cfg_gs)
+                if isinstance(ov_gs, int):
+                    cfg_gs = ov_gs
+
+            if num_groups == 1 and (cfg_gs in (None, -1) or k_full != int(cfg_gs)):
+                group_size = -1
+            else:
+                group_size = k_full // num_groups
+            inferred_pairs.add((bits, group_size))
+
+        if len(inferred_pairs) != 1:
+            raise ValueError(
+                f"Fused linear module {prefix!r} has mismatched GPTQ (bits, group_size) across shards: "
+                f"{sorted(inferred_pairs)}"
+            )
+        bits, group_size = next(iter(inferred_pairs))
+        is_sym = bool(raw_qcfg.get("sym", True))
+        if not is_sym:
+            raise ValueError(
+                f"DxMoE WNA16 non-routed GPTQ linear ({prefix!r}) requires sym=True, got sym=False"
+            )
+        full_cfg = {
+            "bits": bits,
+            "group_size": group_size,
+            "desc_act": False,
+            "sym": True,
+            "lm_head": False,
+        }
+        auto_gptq_cfg = AutoGPTQConfig(
+            weight_bits=bits,
+            group_size=group_size,
+            desc_act=False,
+            is_sym=True,
+            lm_head_quantized=False,
+            dynamic={},
+            full_config=full_cfg,
+        )
+        linear_method = AutoGPTQLinearMethod(auto_gptq_cfg)
+        # Strict DxMoE algorithm invariant: ONLY RoutedExperts undergo dynamic activation
+        # scheduling (A4/A8/A16). Non-routed linears (especially `shared_experts`) MUST
+        # keep activations in FP16/BF16 (`input_dtype=None`, i.e. WNA16).
+        linear_method.input_dtype = None
+        logger.info_once(
+            "DxMoE dispatching quantized non-routed linear (e.g. %s) to W%dA16 "
+            "AutoGPTQLinearMethod (group_size=%d, activations strictly FP16/BF16).",
+            prefix,
+            bits,
+            group_size,
+        )
+        return linear_method
 
     def _validate_deployment_config(self) -> None:
         vllm_cfg = get_current_vllm_config_or_none()
@@ -557,9 +742,23 @@ class DxMoEConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
         if isinstance(layer, LinearBase):
+            param_meta = self._ensure_checkpoint_metadata()
+            if not param_meta:
+                return UnquantizedLinearMethod()
+            shard_prefixes = self._resolve_linear_shard_prefixes(prefix, param_meta)
+            has_qweight = [f"{sp}.qweight" in param_meta for sp in shard_prefixes]
+            if any(has_qweight):
+                if not all(has_qweight):
+                    raise ValueError(
+                        f"Detected mixed GPTQ/float shards for fused LinearBase {prefix!r}: "
+                        f"{shard_prefixes}"
+                    )
+                return self._build_wna16_linear_method(prefix, shard_prefixes, param_meta)
             return UnquantizedLinearMethod()
+
         if isinstance(layer, RoutedExperts):
             specs = self._ensure_resolved()
+            param_meta = self._ensure_checkpoint_metadata()
             m = _LAYER_IDX_RE.search(prefix)
             if m is None:
                 raise ValueError(
@@ -572,18 +771,60 @@ class DxMoEConfig(QuantizationConfig):
                     f"DxMoE metadata ({_DXMOE_META_FILENAME}) is missing RoutedExperts "
                     f"layer {l_idx} (prefix={prefix!r}); available layers: {sorted(specs)}"
                 )
-            return DxMoEMoEMethod(spec, layer.moe_config)
+            ckpt_experts_prefix = prefix.removesuffix(".routed_experts")
+            if param_meta:
+                prefix_dot = f"{ckpt_experts_prefix}."
+                has_routed_qw = any(
+                    k.startswith(prefix_dot) and k.endswith(".qweight")
+                    for k in param_meta
+                )
+                has_routed_fp = any(
+                    k.startswith(prefix_dot)
+                    and (
+                        k.endswith(".weight")
+                        or k == f"{ckpt_experts_prefix}.gate_up_proj"
+                        or k == f"{ckpt_experts_prefix}.down_proj"
+                    )
+                    for k in param_meta
+                )
+                if has_routed_qw and has_routed_fp:
+                    raise ValueError(
+                        f"RoutedExperts {ckpt_experts_prefix!r} mixes GPTQ .qweight and float .weight tensors"
+                    )
+                checkpoint_is_gptq = has_routed_qw
+            else:
+                q_doc = self.raw_config.get("quantization", {})
+                checkpoint_is_gptq = (
+                    self.raw_config.get("checkpoint_format") == "gptq"
+                    or (isinstance(q_doc, dict) and q_doc.get("checkpoint_format") == "gptq")
+                )
+            return DxMoEMoEMethod(
+                spec, layer.moe_config, checkpoint_is_gptq=checkpoint_is_gptq
+            )
         return None
 
 
 class DxMoEMoEMethod(FusedMoEMethodBase):
-    """FusedMoE method loading reconstructed float MoE weights and refitting to DxMoE W4/W8."""
+    """Zero-peak streaming FusedMoE method for GPTQ-packed or float DxMoE W4/W8 weights."""
 
-    def __init__(self, layer_spec: _ParsedDxMoELayerSpec, moe: FusedMoEConfig) -> None:
+    def __init__(
+        self,
+        layer_spec: _ParsedDxMoELayerSpec,
+        moe: FusedMoEConfig,
+        *,
+        checkpoint_is_gptq: bool = False,
+    ) -> None:
         super().__init__(moe)
         self.layer_spec = layer_spec
+        self.checkpoint_is_gptq = bool(checkpoint_is_gptq)
         self.experts_cls = DxMoEExperts
         self._dxmoe_processed = False
+        self._w13_offsets: tuple[int, ...] = ()
+        self._w2_offsets: tuple[int, ...] = ()
+        self._loaded_qweight: set[tuple[int, str]] = set()
+        self._loaded_scales: set[tuple[int, str]] = set()
+        self._loaded_qzeros: set[tuple[int, str]] = set()
+        self._loaded_float_shards: set[tuple[int, str]] = set()
 
     @property
     def supports_eplb(self) -> bool:
@@ -696,31 +937,240 @@ class DxMoEMoEMethod(FusedMoEMethodBase):
         unpadded_inter = self.moe.intermediate_size_per_partition_unpadded
         assert unpadded_hidden is not None and unpadded_inter is not None
 
-        w13_weight = torch.nn.Parameter(
-            torch.empty(
+        probe_dev = torch.empty(0).device
+        w13_codes, w13_scales, w13_w_bits, self._w13_offsets = (
+            allocate_dxmoe_weight_buffers(
                 num_experts,
                 w13_up_dim,
                 hidden_size,
-                dtype=params_dtype,
-            ),
+                spec.w_bits_entry,
+                device=probe_dev,
+            )
+        )
+        w2_codes, w2_scales, w2_w_bits, self._w2_offsets = (
+            allocate_dxmoe_weight_buffers(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                spec.w_bits_down,
+                device=probe_dev,
+            )
+        )
+        layer.register_buffer("_dxmoe_w13_codes", w13_codes, persistent=False)
+        layer.register_buffer("_dxmoe_w13_scales", w13_scales, persistent=False)
+        layer.register_buffer("_dxmoe_w13_w_bits", w13_w_bits, persistent=False)
+        layer.register_buffer("_dxmoe_w2_codes", w2_codes, persistent=False)
+        layer.register_buffer("_dxmoe_w2_scales", w2_scales, persistent=False)
+        layer.register_buffer("_dxmoe_w2_w_bits", w2_w_bits, persistent=False)
+
+        if self.checkpoint_is_gptq:
+            self._register_gptq_proxy_params(
+                layer,
+                num_experts=num_experts,
+                params_dtype=params_dtype,
+                extra_weight_attrs=extra_weight_attrs,
+            )
+        else:
+            self._register_float_proxy_params(
+                layer,
+                num_experts=num_experts,
+                w13_up_dim=w13_up_dim,
+                hidden_size=hidden_size,
+                unpadded_inter=unpadded_inter,
+                unpadded_hidden=unpadded_hidden,
+                params_dtype=params_dtype,
+                extra_weight_attrs=extra_weight_attrs,
+            )
+
+    def _register_gptq_proxy_params(
+        self,
+        layer: RoutedExperts,
+        *,
+        num_experts: int,
+        params_dtype: torch.dtype,
+        extra_weight_attrs: dict[str, Any],
+    ) -> None:
+        proxy_specs = (
+            ("w13_qweight", torch.int32, "qweight"),
+            ("w2_qweight", torch.int32, "qweight"),
+            ("w13_scales", params_dtype, "scales"),
+            ("w2_scales", params_dtype, "scales"),
+            ("w13_qzeros", torch.int32, "qzeros"),
+            ("w2_qzeros", torch.int32, "qzeros"),
+        )
+        for param_name, dtype, kind in proxy_specs:
+            p = torch.nn.Parameter(
+                torch.empty((num_experts, 0), dtype=dtype),
+                requires_grad=False,
+            )
+            layer.register_parameter(param_name, p)
+            set_weight_attrs(p, extra_weight_attrs)
+            loader_fn = self._make_gptq_shard_loader(layer, kind)
+            loader_fn.supports_moe_loading = True  # type: ignore[attr-defined]
+            p.weight_loader = loader_fn  # type: ignore[attr-defined]
+
+    def _register_float_proxy_params(
+        self,
+        layer: RoutedExperts,
+        *,
+        num_experts: int,
+        w13_up_dim: int,
+        hidden_size: int,
+        unpadded_inter: int,
+        unpadded_hidden: int,
+        params_dtype: torch.dtype,
+        extra_weight_attrs: dict[str, Any],
+    ) -> None:
+        w13_weight = torch.nn.Parameter(
+            torch.empty((num_experts, w13_up_dim, 0), dtype=params_dtype),
             requires_grad=False,
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
         w13_weight.weight_loader_numel = num_experts * (2 * unpadded_inter) * unpadded_hidden
+        w13_loader = self._make_float_shard_loader(layer)
+        w13_loader.supports_moe_loading = True  # type: ignore[attr-defined]
+        w13_weight.weight_loader = w13_loader  # type: ignore[attr-defined]
 
         w2_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition,
-                dtype=params_dtype,
-            ),
+            torch.empty((num_experts, hidden_size, 0), dtype=params_dtype),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
         w2_weight.weight_loader_numel = num_experts * unpadded_hidden * unpadded_inter
+        w2_loader = self._make_float_shard_loader(layer)
+        w2_loader.supports_moe_loading = True  # type: ignore[attr-defined]
+        w2_weight.weight_loader = w2_loader  # type: ignore[attr-defined]
+
+    def _make_gptq_shard_loader(self, layer: RoutedExperts, kind: str):
+        spec = self.layer_spec
+
+        @torch.no_grad()
+        def _loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: int,
+            return_success: bool = False,
+        ) -> bool | None:
+            local_e = layer._map_global_expert_id_to_local_expert_id(int(expert_id))
+            if local_e == -1:
+                return False if return_success else None
+            if shard_id not in ("w1", "w2", "w3"):
+                raise ValueError(f"Unexpected MoE shard_id={shard_id!r} for {weight_name!r}")
+            if not 0 <= local_e < spec.num_experts:
+                raise ValueError(
+                    f"Layer {spec.layer_idx} expert_id={local_e} out of [0, {spec.num_experts})"
+                )
+
+            is_entry = shard_id in ("w1", "w3")
+            w_bits = spec.w_bits_entry[local_e] if is_entry else spec.w_bits_down[local_e]
+            k_exp = spec.hidden_size if is_entry else spec.inter_size
+            n_exp = spec.inter_size if is_entry else spec.hidden_size
+            codes_buf = layer._dxmoe_w13_codes if is_entry else layer._dxmoe_w2_codes
+            scales_buf = layer._dxmoe_w13_scales if is_entry else layer._dxmoe_w2_scales
+            target_dev = codes_buf.device
+
+            if kind == "qweight":
+                repacked = repack_gptq_qweight_shard(
+                    loaded_weight,
+                    k_expected=k_exp,
+                    n_expected=n_exp,
+                    w_bits=w_bits,
+                    target_device=target_dev,
+                )
+                row_bytes = k_exp // 2 if w_bits == 4 else k_exp
+                shard_nbytes = n_exp * row_bytes
+                base_off = (
+                    self._w13_offsets[local_e] if is_entry else self._w2_offsets[local_e]
+                )
+                if shard_id == "w3":
+                    base_off += shard_nbytes
+                codes_buf[base_off : base_off + shard_nbytes].copy_(repacked.view(-1))
+                self._loaded_qweight.add((local_e, shard_id))
+            elif kind == "scales":
+                s_f16 = validate_gptq_scales_shard(
+                    loaded_weight,
+                    n_expected=n_exp,
+                    target_device=scales_buf.device,
+                )
+                if shard_id == "w1":
+                    scales_buf[local_e, :n_exp].copy_(s_f16)
+                elif shard_id == "w3":
+                    scales_buf[local_e, n_exp : 2 * n_exp].copy_(s_f16)
+                else:
+                    scales_buf[local_e, :n_exp].copy_(s_f16)
+                self._loaded_scales.add((local_e, shard_id))
+            else:
+                assert kind == "qzeros"
+                validate_gptq_qzeros_shard(
+                    loaded_weight,
+                    n_expected=n_exp,
+                    w_bits=w_bits,
+                )
+                self._loaded_qzeros.add((local_e, shard_id))
+
+            return True if return_success else None
+
+        return _loader
+
+    def _make_float_shard_loader(self, layer: RoutedExperts):
+        spec = self.layer_spec
+
+        @torch.no_grad()
+        def _loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: int,
+            return_success: bool = False,
+        ) -> bool | None:
+            local_e = layer._map_global_expert_id_to_local_expert_id(int(expert_id))
+            if local_e == -1:
+                return False if return_success else None
+            if shard_id not in ("w1", "w2", "w3"):
+                raise ValueError(f"Unexpected MoE shard_id={shard_id!r} for {weight_name!r}")
+            if not 0 <= local_e < spec.num_experts:
+                raise ValueError(
+                    f"Layer {spec.layer_idx} expert_id={local_e} out of [0, {spec.num_experts})"
+                )
+
+            is_entry = shard_id in ("w1", "w3")
+            w_bits = spec.w_bits_entry[local_e] if is_entry else spec.w_bits_down[local_e]
+            k_exp = spec.hidden_size if is_entry else spec.inter_size
+            n_exp = spec.inter_size if is_entry else spec.hidden_size
+            if loaded_weight.ndim != 2 or tuple(loaded_weight.shape) != (n_exp, k_exp):
+                raise ValueError(
+                    f"Layer {spec.layer_idx} expert {local_e} ({shard_id}) expected float shape "
+                    f"({n_exp}, {k_exp}), got {tuple(loaded_weight.shape)}"
+                )
+
+            codes_buf = layer._dxmoe_w13_codes if is_entry else layer._dxmoe_w2_codes
+            scales_buf = layer._dxmoe_w13_scales if is_entry else layer._dxmoe_w2_scales
+            packed, s_f16 = pack_dxmoe_float_matrix(
+                loaded_weight.to(device=codes_buf.device), w_bits
+            )
+            row_bytes = k_exp // 2 if w_bits == 4 else k_exp
+            shard_nbytes = n_exp * row_bytes
+            base_off = (
+                self._w13_offsets[local_e] if is_entry else self._w2_offsets[local_e]
+            )
+            if shard_id == "w3":
+                base_off += shard_nbytes
+            codes_buf[base_off : base_off + shard_nbytes].copy_(packed.view(-1))
+            if shard_id == "w1":
+                scales_buf[local_e, :n_exp].copy_(s_f16)
+            elif shard_id == "w3":
+                scales_buf[local_e, n_exp : 2 * n_exp].copy_(s_f16)
+            else:
+                scales_buf[local_e, :n_exp].copy_(s_f16)
+            self._loaded_float_shards.add((local_e, shard_id))
+            return True if return_success else None
+
+        return _loader
 
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts
@@ -734,20 +1184,82 @@ class DxMoEMoEMethod(FusedMoEMethodBase):
         self._dxmoe_processed = True
 
         spec = self.layer_spec
-        device = layer.w13_weight.device
-        w13_packed = pack_dxmoe_weight_channel(layer.w13_weight.data, spec.w_bits_entry)
-        w2_packed = pack_dxmoe_weight_channel(layer.w2_weight.data, spec.w_bits_down)
+        vllm_cfg = get_current_vllm_config_or_none()
+        is_dummy_load = (
+            vllm_cfg is not None
+            and vllm_cfg.load_config is not None
+            and vllm_cfg.load_config.load_format == "dummy"
+        )
+        expected_shards = {
+            (e_idx, s_id)
+            for e_idx in range(spec.num_experts)
+            for s_id in ("w1", "w2", "w3")
+        }
+        if not is_dummy_load:
+            if self.checkpoint_is_gptq:
+                for label, loaded_set in (
+                    ("qweight", self._loaded_qweight),
+                    ("scales", self._loaded_scales),
+                    ("qzeros", self._loaded_qzeros),
+                ):
+                    missing = sorted(expected_shards - loaded_set)
+                    if missing:
+                        raise ValueError(
+                            f"Layer {spec.layer_idx} missing GPTQ {label} expert shards "
+                            f"(sample: {missing[:4]})"
+                        )
+            else:
+                missing = sorted(expected_shards - self._loaded_float_shards)
+                if missing:
+                    raise ValueError(
+                        f"Layer {spec.layer_idx} missing float expert weight shards "
+                        f"(sample: {missing[:4]})"
+                    )
 
-        # Register packed tensors on `layer` so module lifetime owns all GPU allocations.
-        layer.register_buffer("_dxmoe_w13_codes", w13_packed.codes_arena, persistent=False)
-        layer.register_buffer("_dxmoe_w13_scales", w13_packed.scales, persistent=False)
-        layer.register_buffer("_dxmoe_w13_w_bits", w13_packed.w_bits_dev, persistent=False)
+        ref_param = (
+            getattr(layer, "w13_qweight", None)
+            if self.checkpoint_is_gptq
+            else getattr(layer, "w13_weight", None)
+        )
+        device = (
+            ref_param.device
+            if isinstance(ref_param, torch.Tensor)
+            else layer._dxmoe_w13_codes.device
+        )
+        for buf_name in (
+            "_dxmoe_w13_codes",
+            "_dxmoe_w13_scales",
+            "_dxmoe_w13_w_bits",
+            "_dxmoe_w2_codes",
+            "_dxmoe_w2_scales",
+            "_dxmoe_w2_w_bits",
+        ):
+            buf = getattr(layer, buf_name)
+            if buf.device != device:
+                layer.register_buffer(buf_name, buf.to(device=device).contiguous(), persistent=False)
+
+        w13_packed = finalize_dxmoe_weight_channel(
+            num_experts=spec.num_experts,
+            n=2 * spec.inter_size,
+            k=spec.hidden_size,
+            w_bits_list=spec.w_bits_entry,
+            codes_arena=layer._dxmoe_w13_codes,
+            scales=layer._dxmoe_w13_scales,
+            w_bits_dev=layer._dxmoe_w13_w_bits,
+            expert_offsets=self._w13_offsets,
+        )
+        w2_packed = finalize_dxmoe_weight_channel(
+            num_experts=spec.num_experts,
+            n=spec.hidden_size,
+            k=spec.inter_size,
+            w_bits_list=spec.w_bits_down,
+            codes_arena=layer._dxmoe_w2_codes,
+            scales=layer._dxmoe_w2_scales,
+            w_bits_dev=layer._dxmoe_w2_w_bits,
+            expert_offsets=self._w2_offsets,
+        )
         layer.register_buffer("_dxmoe_w13_w_ptrs", w13_packed.w_ptrs_dev, persistent=False)
         layer.register_buffer("_dxmoe_w13_sw_ptrs", w13_packed.sw_ptrs_dev, persistent=False)
-
-        layer.register_buffer("_dxmoe_w2_codes", w2_packed.codes_arena, persistent=False)
-        layer.register_buffer("_dxmoe_w2_scales", w2_packed.scales, persistent=False)
-        layer.register_buffer("_dxmoe_w2_w_bits", w2_packed.w_bits_dev, persistent=False)
         layer.register_buffer("_dxmoe_w2_w_ptrs", w2_packed.w_ptrs_dev, persistent=False)
         layer.register_buffer("_dxmoe_w2_sw_ptrs", w2_packed.sw_ptrs_dev, persistent=False)
 
@@ -775,8 +1287,20 @@ class DxMoEMoEMethod(FusedMoEMethodBase):
         layer.register_buffer("_dxmoe_beta_entry", beta_entry_dev, persistent=False)
         layer.register_buffer("_dxmoe_beta_down", beta_down_dev, persistent=False)
 
-        # Free dense float MoE weights while keeping 3D [E, N, 0] placeholders for
-        # FusedMoEKernel.moe_problem_size (`local_num_experts = w1.shape[0]`).
+        if self.checkpoint_is_gptq:
+            for pname in (
+                "w13_qweight",
+                "w2_qweight",
+                "w13_scales",
+                "w2_scales",
+                "w13_qzeros",
+                "w2_qzeros",
+            ):
+                if pname in layer._parameters:
+                    del layer._parameters[pname]
+
+        # Keep 3D [E, N, 0] placeholders for FusedMoEKernel.moe_problem_size
+        # (`local_num_experts = w1.shape[0]`) with zero data bytes.
         empty_w13 = torch.empty(
             (spec.num_experts, 2 * spec.inter_size, 0),
             dtype=torch.uint8,
@@ -787,9 +1311,20 @@ class DxMoEMoEMethod(FusedMoEMethodBase):
             dtype=torch.uint8,
             device=device,
         )
-        replace_parameter(layer, "w13_weight", empty_w13)
-        replace_parameter(layer, "w2_weight", empty_w2)
-        torch.cuda.empty_cache()
+        if "w13_weight" in layer._parameters:
+            replace_parameter(layer, "w13_weight", empty_w13)
+        else:
+            layer.register_parameter(
+                "w13_weight", torch.nn.Parameter(empty_w13, requires_grad=False)
+            )
+        if "w2_weight" in layer._parameters:
+            replace_parameter(layer, "w2_weight", empty_w2)
+        else:
+            layer.register_parameter(
+                "w2_weight", torch.nn.Parameter(empty_w2, requires_grad=False)
+            )
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         runtime_state = DxMoELayerRuntimeState(
             layer_idx=spec.layer_idx,

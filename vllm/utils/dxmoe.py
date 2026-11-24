@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import sys
 import threading
 import weakref
 
@@ -349,120 +350,96 @@ class DxMoELayerWeights:
     has_w8: bool
 
 
-def pack_dxmoe_weight_channel(
-    weight_3d: torch.Tensor,
-    w_bits_list: Sequence[int],
-) -> DxMoELayerWeights:
-    """Refit and pack reconstructed symmetric G=-1 float weights `[E, N, K]` to ABI 12 W4/W8.
+GPTQ_SYM_QZEROS: dict[int, int] = {
+    4: 0x77777777,
+    8: 0x7F7F7F7F,
+}
 
-    Note: Standard HF DxMoE exports store dequantized FP16/BF16 weights (`safetensors`)
-    without raw integer codes or FP32 channel scales. This function executes a
-    multi-candidate grid search plus least-squares FP16 scale refit per output channel
-    to reconstruct `uint8` W4/W8 codes and `float16` channel scales (not a bit-lossless
-    recovery of the offline quantizer's internal integer state).
-    """
-    if weight_3d.ndim != 3:
-        raise ValueError(f"Expected 3D MoE weight [E, N, K], got {tuple(weight_3d.shape)}")
-    num_experts, n, k = (
-        int(weight_3d.shape[0]),
-        int(weight_3d.shape[1]),
-        int(weight_3d.shape[2]),
-    )
+_W4_REFIT_DENOMS: tuple[float, ...] = (8.0, 7.5, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0)
+_W8_REFIT_DENOMS: tuple[float, ...] = tuple(float(m) for m in range(128, 95, -1)) + (
+    127.5,
+    80.0,
+    64.0,
+    48.0,
+    32.0,
+    16.0,
+    8.0,
+    4.0,
+    2.0,
+    1.0,
+)
+
+
+def compute_dxmoe_arena_layout(
+    num_experts: int,
+    n: int,
+    k: int,
+    w_bits_list: Sequence[int],
+) -> tuple[tuple[int, ...], tuple[int, ...], int]:
+    """Validate `(E, N, K, w_bits)` and compute 256B-aligned per-expert byte offsets."""
     if len(w_bits_list) != num_experts:
         raise ValueError(
             f"w_bits_list length {len(w_bits_list)} != num_experts {num_experts}"
         )
-    if n <= 0 or k <= 0 or n % 256 != 0 or k % 128 != 0:
+    if num_experts <= 0 or n <= 0 or k <= 0 or n % 256 != 0 or k % 128 != 0:
         raise ValueError(
-            f"DxMoE ABI {DXMOE_ABI_VERSION} requires N % 256 == 0 and K % 128 == 0, got N={n}, K={k}"
+            f"DxMoE ABI {DXMOE_ABI_VERSION} requires E > 0, N % 256 == 0, and K % 128 == 0, "
+            f"got E={num_experts}, N={n}, K={k}"
         )
-    bits_clean = [int(b) for b in w_bits_list]
+    bits_clean = tuple(int(b) for b in w_bits_list)
     if any(b not in (4, 8) for b in bits_clean):
         raise ValueError(
             f"DxMoE native kernel requires expert w_bits in {{4, 8}}, got {set(bits_clean)}"
         )
-
-    device = weight_3d.device
     expert_offsets: list[int] = []
     running_bytes = 0
     for b in bits_clean:
         expert_offsets.append(running_bytes)
         expert_bytes = n * (k // 2 if b == 4 else k)
         running_bytes = round_up(running_bytes + expert_bytes, 256)
+    return bits_clean, tuple(expert_offsets), max(running_bytes, 256)
 
-    codes_arena = torch.empty((max(running_bytes, 256),), dtype=torch.uint8, device=device)
-    scales = torch.empty((num_experts, n), dtype=torch.float16, device=device)
 
-    with torch.no_grad():
-        w4_denoms = (8.0, 7.5, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0)
-        w8_denoms = tuple(float(m) for m in range(128, 95, -1)) + (
-            127.5,
-            80.0,
-            64.0,
-            48.0,
-            32.0,
-            16.0,
-            8.0,
-            4.0,
-            2.0,
-            1.0,
-        )
-        for e, b in enumerate(bits_clean):
-            w_f32 = weight_3d[e].to(dtype=torch.float32)
-            qmin_abs, qmax_pos, zero = (8.0, 7.0, 8) if b == 4 else (128.0, 127.0, 128)
-            amax = w_f32.abs().amax(dim=-1)
-            denoms = w4_denoms if b == 4 else w8_denoms
+def allocate_dxmoe_weight_buffers(
+    num_experts: int,
+    n: int,
+    k: int,
+    w_bits_list: Sequence[int],
+    *,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, ...]]:
+    """Pre-allocate packed DxMoE weight buffers without materializing FP16 weights."""
+    bits_clean, expert_offsets, arena_bytes = compute_dxmoe_arena_layout(
+        num_experts, n, k, w_bits_list
+    )
+    codes_arena = torch.zeros((arena_bytes,), dtype=torch.uint8, device=device)
+    scales = torch.ones((num_experts, n), dtype=torch.float16, device=device)
+    w_bits_dev = torch.tensor(bits_clean, dtype=torch.int32, device=device)
+    return codes_arena, scales, w_bits_dev, expert_offsets
 
-            best_err = torch.full((n,), float("inf"), dtype=torch.float32, device=device)
-            best_s = torch.ones((n,), dtype=torch.float16, device=device)
-            best_q = torch.zeros((n, k), dtype=torch.int16, device=device)
 
-            for m_val in denoms:
-                s_cand = torch.where(amax > 0.0, amax / m_val, torch.ones_like(amax))
-                q_cand = torch.round(w_f32 / s_cand.unsqueeze(-1)).clamp(
-                    -qmin_abs, qmax_pos
-                )
-                denom = (q_cand * q_cand).sum(dim=-1)
-                s_ls = torch.where(
-                    denom > 0.0,
-                    (w_f32 * q_cand).sum(dim=-1) / denom,
-                    torch.ones_like(amax),
-                )
-                s_f16 = s_ls.clamp(min=1e-7, max=65504.0).to(dtype=torch.float16)
-                s_f32 = s_f16.to(dtype=torch.float32)
-                q_fin = torch.round(w_f32 / s_f32.unsqueeze(-1)).clamp(
-                    -qmin_abs, qmax_pos
-                )
-                err = (q_fin * s_f32.unsqueeze(-1) - w_f32).square().sum(dim=-1)
-                improved = err < best_err
-                if bool(improved.any()):
-                    best_err = torch.where(improved, err, best_err)
-                    best_s = torch.where(improved, s_f16, best_s)
-                    best_q = torch.where(
-                        improved.unsqueeze(-1), q_fin.to(dtype=torch.int16), best_q
-                    )
-
-            scales[e].copy_(best_s)
-            u8 = (best_q + zero).to(dtype=torch.uint8)
-            packed = (
-                (u8[:, 0::2] | (u8[:, 1::2] << 4)).contiguous()
-                if b == 4
-                else u8.contiguous()
-            )
-
-            start = expert_offsets[e]
-            nbytes = packed.numel()
-            codes_arena[start : start + nbytes].copy_(packed.view(-1))
-
+def finalize_dxmoe_weight_channel(
+    *,
+    num_experts: int,
+    n: int,
+    k: int,
+    w_bits_list: Sequence[int],
+    codes_arena: torch.Tensor,
+    scales: torch.Tensor,
+    w_bits_dev: torch.Tensor,
+    expert_offsets: Sequence[int],
+) -> DxMoELayerWeights:
+    """Build device pointer tables (`w_ptrs_dev`, `sw_ptrs_dev`) on finalized packed buffers."""
+    if not bool(torch.isfinite(scales).all()) or bool((scales <= 0).any()):
+        raise ValueError("DxMoE weight scales must be finite and strictly positive")
+    device = codes_arena.device
     arena_base = int(codes_arena.data_ptr())
     scales_base = int(scales.data_ptr())
-    w_ptrs_host = [arena_base + off for off in expert_offsets]
+    w_ptrs_host = [arena_base + int(off) for off in expert_offsets]
     sw_ptrs_host = [scales_base + e * n * 2 for e in range(num_experts)]
-
-    w_bits_dev = torch.tensor(bits_clean, dtype=torch.int32, device=device)
     w_ptrs_dev = torch.tensor(w_ptrs_host, dtype=torch.int64, device=device)
     sw_ptrs_dev = torch.tensor(sw_ptrs_host, dtype=torch.int64, device=device)
-
+    bits_clean = [int(b) for b in w_bits_list]
     return DxMoELayerWeights(
         num_experts=num_experts,
         n=n,
@@ -473,6 +450,190 @@ def pack_dxmoe_weight_channel(
         w_ptrs_dev=w_ptrs_dev,
         sw_ptrs_dev=sw_ptrs_dev,
         has_w8=any(b == 8 for b in bits_clean),
+    )
+
+
+def repack_gptq_qweight_shard(
+    qweight: torch.Tensor,
+    *,
+    k_expected: int,
+    n_expected: int,
+    w_bits: int,
+    target_device: torch.device,
+) -> torch.Tensor:
+    """Bit-losslessly transpose GPTQ `int32 [K // pf, N]` into DxMoE `uint8 [N, K * w_bits // 8]`."""
+    if w_bits not in (4, 8):
+        raise ValueError(f"Unsupported DxMoE w_bits={w_bits}; expected 4 or 8")
+    pack_factor = 32 // w_bits
+    expected_shape = (k_expected // pack_factor, n_expected)
+    if (
+        not isinstance(qweight, torch.Tensor)
+        or qweight.ndim != 2
+        or qweight.dtype != torch.int32
+        or tuple(qweight.shape) != expected_shape
+    ):
+        raise ValueError(
+            f"Expected GPTQ qweight int32 {expected_shape} for W{w_bits}, "
+            f"got {getattr(qweight, 'dtype', None)} {tuple(getattr(qweight, 'shape', ()))}"
+        )
+    qw_dev = qweight.to(device=target_device)
+    if sys.byteorder == "little":
+        return qw_dev.transpose(0, 1).contiguous().view(torch.uint8)
+    shifts = torch.tensor([0, 8, 16, 24], dtype=torch.int32, device=target_device).view(1, 1, 4)
+    return (
+        ((qw_dev.transpose(0, 1).unsqueeze(-1) >> shifts) & 0xFF)
+        .to(dtype=torch.uint8)
+        .reshape(n_expected, -1)
+        .contiguous()
+    )
+
+
+def validate_gptq_scales_shard(
+    scales: torch.Tensor,
+    *,
+    n_expected: int,
+    target_device: torch.device,
+) -> torch.Tensor:
+    """Validate channel-wise (`group_size == -1`) GPTQ scales `[1, N]` and return `float16 [N]`."""
+    if not isinstance(scales, torch.Tensor) or not scales.is_floating_point():
+        raise ValueError(f"GPTQ scales must be a floating-point Tensor, got {type(scales)}")
+    if scales.ndim == 2 and scales.shape[0] != 1:
+        raise ValueError(
+            f"DxMoE native operator requires channel-wise GPTQ scales [1, {n_expected}] "
+            f"(group_size=-1), got {tuple(scales.shape)}"
+        )
+    if tuple(scales.shape) not in ((1, n_expected), (n_expected,)):
+        raise ValueError(
+            f"Expected GPTQ scales shape (1, {n_expected}), got {tuple(scales.shape)}"
+        )
+    s_f16 = scales.to(device=target_device, dtype=torch.float16).reshape(n_expected)
+    if not bool(torch.isfinite(s_f16).all()) or bool((s_f16 <= 0).any()):
+        raise ValueError("DxMoE GPTQ weight scales must be finite and strictly positive")
+    return s_f16
+
+
+def validate_gptq_qzeros_shard(
+    qzeros: torch.Tensor,
+    *,
+    n_expected: int,
+    w_bits: int,
+) -> None:
+    """Validate channel-wise (`group_size == -1`) symmetric `gptq-v1` `qzeros`."""
+    if w_bits not in GPTQ_SYM_QZEROS:
+        raise ValueError(f"Unsupported DxMoE w_bits={w_bits}")
+    pack_factor = 32 // w_bits
+    expected_shape = (1, n_expected // pack_factor)
+    if not isinstance(qzeros, torch.Tensor) or qzeros.dtype != torch.int32:
+        raise ValueError(f"GPTQ qzeros must be int32, got {getattr(qzeros, 'dtype', None)}")
+    if qzeros.ndim == 2 and qzeros.shape[0] != 1:
+        raise ValueError(
+            f"DxMoE native operator requires channel-wise GPTQ qzeros {expected_shape} "
+            f"(group_size=-1), got {tuple(qzeros.shape)}"
+        )
+    if tuple(qzeros.shape) != expected_shape:
+        raise ValueError(
+            f"Expected GPTQ qzeros shape {expected_shape} for W{w_bits}, got {tuple(qzeros.shape)}"
+        )
+    expected_val = GPTQ_SYM_QZEROS[w_bits]
+    if not bool((qzeros == expected_val).all()):
+        raise ValueError(
+            f"DxMoE native operator requires symmetric gptq-v1 qzeros "
+            f"(expected 0x{expected_val:08x} for W{w_bits})"
+        )
+
+
+@torch.no_grad()
+def pack_dxmoe_float_matrix(
+    weight_2d: torch.Tensor,
+    w_bits: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Refit and pack one 2D symmetric G=-1 float weight `[N, K]` to `(packed_u8, scales_f16)`."""
+    if weight_2d.ndim != 2:
+        raise ValueError(f"Expected 2D weight [N, K], got {tuple(weight_2d.shape)}")
+    if w_bits not in (4, 8):
+        raise ValueError(f"Expected w_bits in {{4, 8}}, got {w_bits!r}")
+    n, k = int(weight_2d.shape[0]), int(weight_2d.shape[1])
+    device = weight_2d.device
+    w_f32 = weight_2d.to(dtype=torch.float32)
+    qmin_abs, qmax_pos, zero = (8.0, 7.0, 8) if w_bits == 4 else (128.0, 127.0, 128)
+    amax = w_f32.abs().amax(dim=-1)
+    denoms = _W4_REFIT_DENOMS if w_bits == 4 else _W8_REFIT_DENOMS
+
+    best_err = torch.full((n,), float("inf"), dtype=torch.float32, device=device)
+    best_s = torch.ones((n,), dtype=torch.float16, device=device)
+    best_q = torch.zeros((n, k), dtype=torch.int16, device=device)
+
+    for m_val in denoms:
+        s_cand = torch.where(amax > 0.0, amax / m_val, torch.ones_like(amax))
+        q_cand = torch.round(w_f32 / s_cand.unsqueeze(-1)).clamp(-qmin_abs, qmax_pos)
+        denom = (q_cand * q_cand).sum(dim=-1)
+        s_ls = torch.where(
+            denom > 0.0,
+            (w_f32 * q_cand).sum(dim=-1) / denom,
+            torch.ones_like(amax),
+        )
+        s_f16 = s_ls.clamp(min=1e-7, max=65504.0).to(dtype=torch.float16)
+        s_f32 = s_f16.to(dtype=torch.float32)
+        q_fin = torch.round(w_f32 / s_f32.unsqueeze(-1)).clamp(-qmin_abs, qmax_pos)
+        err = (q_fin * s_f32.unsqueeze(-1) - w_f32).square().sum(dim=-1)
+        improved = err < best_err
+        if bool(improved.any()):
+            best_err = torch.where(improved, err, best_err)
+            best_s = torch.where(improved, s_f16, best_s)
+            best_q = torch.where(
+                improved.unsqueeze(-1), q_fin.to(dtype=torch.int16), best_q
+            )
+
+    u8 = (best_q + zero).to(dtype=torch.uint8)
+    packed = (
+        (u8[:, 0::2] | (u8[:, 1::2] << 4)).contiguous()
+        if w_bits == 4
+        else u8.contiguous()
+    )
+    return packed, best_s
+
+
+def pack_dxmoe_weight_channel(
+    weight_3d: torch.Tensor,
+    w_bits_list: Sequence[int],
+) -> DxMoELayerWeights:
+    """Refit and pack reconstructed symmetric G=-1 float weights `[E, N, K]` to ABI 12 W4/W8.
+
+    Note: Legacy float HF DxMoE exports store dequantized FP16/BF16 weights (`safetensors`)
+    without raw integer codes or FP32 channel scales. This function executes a
+    multi-candidate grid search plus least-squares FP16 scale refit per output channel
+    to reconstruct `uint8` W4/W8 codes and `float16` channel scales (whereas standard
+    HF GPTQ checkpoints bypass this refit and load losslessly via `repack_gptq_qweight_shard`).
+    """
+    if weight_3d.ndim != 3:
+        raise ValueError(f"Expected 3D MoE weight [E, N, K], got {tuple(weight_3d.shape)}")
+    num_experts, n, k = (
+        int(weight_3d.shape[0]),
+        int(weight_3d.shape[1]),
+        int(weight_3d.shape[2]),
+    )
+    device = weight_3d.device
+    codes_arena, scales, w_bits_dev, expert_offsets = allocate_dxmoe_weight_buffers(
+        num_experts, n, k, w_bits_list, device=device
+    )
+
+    with torch.no_grad():
+        for e, b in enumerate(w_bits_list):
+            packed, best_s = pack_dxmoe_float_matrix(weight_3d[e], int(b))
+            scales[e].copy_(best_s)
+            start = expert_offsets[e]
+            nbytes = packed.numel()
+            codes_arena[start : start + nbytes].copy_(packed.view(-1))
+
+    return finalize_dxmoe_weight_channel(
+        num_experts=num_experts,
+        n=n,
+        k=k,
+        w_bits_list=w_bits_list,
+        codes_arena=codes_arena,
+        scales=scales,
+        w_bits_dev=w_bits_dev,
+        expert_offsets=expert_offsets,
     )
 
 

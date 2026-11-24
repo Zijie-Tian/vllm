@@ -924,3 +924,467 @@ def test_gpu_real_vllm_router_neg1_padding_single_cudagraph_multi_replay_and_act
     finally:
         if need_cleanup:
             cleanup_dist_env_and_memory()
+
+
+def _pack_sym_gptq_matrix(
+    q_signed: torch.Tensor,
+    scales_1d: torch.Tensor,
+    bits: int,
+    *,
+    group_size: int = -1,
+) -> dict[str, torch.Tensor]:
+    """Pack signed `[-2^(b-1), 2^(b-1)-1]` codes `[N, K]` into standard HF GPTQ tensors."""
+    assert bits in (4, 8)
+    n_out, k_in = int(q_signed.shape[0]), int(q_signed.shape[1])
+    pack_factor = 32 // bits
+    zero_val = 1 << (bits - 1)
+    mask = (1 << bits) - 1
+    q_u8 = (q_signed.to(dtype=torch.int32) + zero_val) & mask
+    q_kn = q_u8.transpose(0, 1).contiguous().reshape(k_in // pack_factor, pack_factor, n_out)
+    qweight = torch.zeros((k_in // pack_factor, n_out), dtype=torch.int32)
+    for i in range(pack_factor):
+        qweight |= q_kn[:, i, :] << (i * bits)
+
+    num_groups = 1 if group_size == -1 else k_in // group_size
+    if scales_1d.ndim == 1:
+        scales_gn = scales_1d.to(dtype=torch.float16).unsqueeze(0).expand(num_groups, n_out).contiguous()
+    else:
+        scales_gn = scales_1d.to(dtype=torch.float16).contiguous()
+    qz_val = 0x77777777 if bits == 4 else 0x7F7F7F7F
+    qzeros = torch.full((num_groups, n_out // pack_factor), qz_val, dtype=torch.int32)
+    g_idx = (
+        torch.zeros((k_in,), dtype=torch.int32)
+        if group_size == -1
+        else torch.div(torch.arange(k_in, dtype=torch.int32), group_size, rounding_mode="floor")
+    )
+    return {"qweight": qweight, "scales": scales_gn, "qzeros": qzeros, "g_idx": g_idx}
+
+
+def test_dxmoe_gptq_repack_is_bit_lossless_and_rejects_grouped_or_asymmetric() -> None:
+    gen = torch.Generator(device="cpu").manual_seed(2026)
+    n_out, k_in = 256, 128
+    for bits in (4, 8):
+        lo, hi, zero = (-8, 8, 8) if bits == 4 else (-127, 128, 128)
+        q_signed = torch.randint(lo, hi, (n_out, k_in), generator=gen, dtype=torch.int16)
+        scales = (torch.rand((n_out,), generator=gen, dtype=torch.float32) * 0.04 + 0.005).to(
+            torch.float16
+        )
+        pkg = _pack_sym_gptq_matrix(q_signed, scales, bits, group_size=-1)
+        repacked = vllm_dxmoe.repack_gptq_qweight_shard(
+            pkg["qweight"],
+            k_expected=k_in,
+            n_expected=n_out,
+            w_bits=bits,
+            target_device=torch.device("cpu"),
+        )
+        s_checked = vllm_dxmoe.validate_gptq_scales_shard(
+            pkg["scales"], n_expected=n_out, target_device=torch.device("cpu")
+        )
+        vllm_dxmoe.validate_gptq_qzeros_shard(
+            pkg["qzeros"], n_expected=n_out, w_bits=bits
+        )
+
+        u8_expected = (q_signed + zero).to(dtype=torch.uint8)
+        expected_codes = (
+            (u8_expected[:, 0::2] | (u8_expected[:, 1::2] << 4)).contiguous()
+            if bits == 4
+            else u8_expected.contiguous()
+        )
+        assert torch.equal(repacked, expected_codes)
+        assert torch.equal(s_checked, scales)
+
+    # Reject group_size != -1 scales and asymmetric qzeros
+    pkg_g64 = _pack_sym_gptq_matrix(
+        torch.randint(-8, 8, (n_out, k_in), generator=gen, dtype=torch.int16),
+        torch.full((2, n_out), 0.02, dtype=torch.float16),
+        4,
+        group_size=64,
+    )
+    with pytest.raises(ValueError, match="group_size=-1"):
+        vllm_dxmoe.validate_gptq_scales_shard(
+            pkg_g64["scales"], n_expected=n_out, target_device=torch.device("cpu")
+        )
+    with pytest.raises(ValueError, match="group_size=-1"):
+        vllm_dxmoe.validate_gptq_qzeros_shard(
+            pkg_g64["qzeros"], n_expected=n_out, w_bits=4
+        )
+    bad_qz = torch.full((1, n_out // 8), 0x66666666, dtype=torch.int32)
+    with pytest.raises(ValueError, match="symmetric gptq-v1 qzeros"):
+        vllm_dxmoe.validate_gptq_qzeros_shard(bad_qz, n_expected=n_out, w_bits=4)
+
+
+def test_dxmoe_adaptive_shared_experts_wna16_vs_fp16_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify adaptive shared_experts dispatch: FP16 -> UnquantizedLinearMethod, GPTQ -> AutoGPTQLinearMethod (strictly WNA16)."""
+    from vllm.model_executor.layers.linear import MergedColumnParallelLinear, RowParallelLinear
+    from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQLinearMethod
+
+    # Even if VLLM_MARLIN_INPUT_DTYPE is set to int8 in env, DxMoE MUST keep shared_experts WNA16!
+    monkeypatch.setenv("VLLM_MARLIN_INPUT_DTYPE", "int8")
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.auto_gptq.verify_marlin_supported",
+        lambda **_kw: None,
+    )
+
+    h_dim, i_dim, shared_i = 256, 256, 256
+    meta_doc = _sample_dxmoe_meta(layers=(1,), hidden_size=h_dim, inter_size=i_dim, num_experts=2, top_k=1, w_bits=(4, 8))
+
+    for case_name, quantize_shared, shared_gs in (
+        ("shared_fp16", False, -1),
+        ("shared_gptq_g_neg1", True, -1),
+        ("shared_gptq_g128", True, 128),
+    ):
+        case_dir = tmp_path / case_name
+        case_dir.mkdir()
+        (case_dir / "dxmoe_meta.json").write_text(json.dumps(meta_doc), encoding="utf-8")
+        qcfg_doc = {
+            "bits": 4,
+            "group_size": -1,
+            "sym": True,
+            "desc_act": False,
+            "quant_method": "gptq",
+            "checkpoint_format": "gptq",
+            "modules_in_block_to_quantize": ["mlp.experts."]
+            + (["mlp.shared_experts."] if quantize_shared else []),
+            "lm_head": False,
+        }
+        if quantize_shared and shared_gs != -1:
+            qcfg_doc["dynamic"] = {r"+:.*mlp\.shared_experts\..*": {"bits": 4, "group_size": shared_gs}}
+        (case_dir / "config.json").write_text(
+            json.dumps({"model_type": "deepseek_v2", "quantization_config": qcfg_doc}),
+            encoding="utf-8",
+        )
+
+        st_tensors: dict[str, torch.Tensor] = {
+            "model.layers.1.self_attn.q_proj.weight": torch.zeros((h_dim, h_dim), dtype=torch.float16),
+        }
+        for e_idx, bw in enumerate((4, 8)):
+            for proj, (n_d, k_d) in (
+                ("gate_proj", (i_dim, h_dim)),
+                ("up_proj", (i_dim, h_dim)),
+                ("down_proj", (h_dim, i_dim)),
+            ):
+                pkg = _pack_sym_gptq_matrix(
+                    torch.zeros((n_d, k_d), dtype=torch.int16),
+                    torch.ones((n_d,), dtype=torch.float16),
+                    bw,
+                    group_size=-1,
+                )
+                for suf, t in pkg.items():
+                    st_tensors[f"model.layers.1.mlp.experts.{e_idx}.{proj}.{suf}"] = t
+
+        if quantize_shared:
+            for proj, (n_d, k_d) in (
+                ("gate_proj", (shared_i, h_dim)),
+                ("up_proj", (shared_i, h_dim)),
+                ("down_proj", (h_dim, shared_i)),
+            ):
+                n_grp = 1 if shared_gs == -1 else k_d // shared_gs
+                pkg_s = _pack_sym_gptq_matrix(
+                    torch.zeros((n_d, k_d), dtype=torch.int16),
+                    torch.ones((n_grp, n_d), dtype=torch.float16),
+                    4,
+                    group_size=shared_gs,
+                )
+                for suf, t in pkg_s.items():
+                    st_tensors[f"model.layers.1.mlp.shared_experts.{proj}.{suf}"] = t
+        else:
+            st_tensors["model.layers.1.mlp.shared_experts.gate_proj.weight"] = torch.zeros(
+                (shared_i, h_dim), dtype=torch.float16
+            )
+            st_tensors["model.layers.1.mlp.shared_experts.up_proj.weight"] = torch.zeros(
+                (shared_i, h_dim), dtype=torch.float16
+            )
+            st_tensors["model.layers.1.mlp.shared_experts.down_proj.weight"] = torch.zeros(
+                (h_dim, shared_i), dtype=torch.float16
+            )
+        save_file(st_tensors, str(case_dir / "model.safetensors"))
+
+        dx_cfg = DxMoEConfig({"_model_dir": str(case_dir), **qcfg_doc})
+        dx_cfg.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+
+        dummy_linear = object.__new__(MergedColumnParallelLinear)
+        dummy_down = object.__new__(RowParallelLinear)
+        attn_m = dx_cfg.get_quant_method(dummy_linear, "model.layers.1.self_attn.q_proj")
+        assert isinstance(attn_m, UnquantizedLinearMethod)
+
+        sh_gu_m = dx_cfg.get_quant_method(
+            dummy_linear, "model.layers.1.mlp.shared_experts.gate_up_proj"
+        )
+        sh_dn_m = dx_cfg.get_quant_method(
+            dummy_down, "model.layers.1.mlp.shared_experts.down_proj"
+        )
+        if not quantize_shared:
+            assert isinstance(sh_gu_m, UnquantizedLinearMethod)
+            assert isinstance(sh_dn_m, UnquantizedLinearMethod)
+        else:
+            assert isinstance(sh_gu_m, AutoGPTQLinearMethod)
+            assert isinstance(sh_dn_m, AutoGPTQLinearMethod)
+            assert sh_gu_m.input_dtype is None
+            assert sh_dn_m.input_dtype is None
+            assert sh_gu_m.quant_config.group_size == shared_gs
+
+        moe_cfg = _make_moe_config(num_experts=2, top_k=1, hidden_size=h_dim, inter_size=i_dim)
+        routed_stub = object.__new__(RoutedExperts)
+        routed_stub.moe_config = moe_cfg
+        routed_m = dx_cfg.get_quant_method(
+            routed_stub, "model.layers.1.mlp.experts.routed_experts"
+        )
+        assert isinstance(routed_m, DxMoEMoEMethod)
+        assert routed_m.checkpoint_is_gptq is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Single-GPU test requires CUDA")
+@pytest.mark.parametrize("quantize_shared", [False, True])
+def test_dxmoe_vllm_gptq_checkpoint_e2e_fp16_and_wna16_shared_experts(
+    tmp_path: Path, quantize_shared: bool
+) -> None:
+    """Load real DeepseekV2ForCausalLM from GPTQ-packed DxMoE checkpoint with FP16 or W4A16 shared_experts."""
+    cap = torch.cuda.get_device_capability(0)
+    if cap not in ((8, 0), (8, 6)):
+        pytest.skip(f"DxMoE native kernel requires SM80/SM86, got {cap}")
+
+    import socket
+    from vllm.config import ModelConfig
+    from vllm.distributed import (
+        cleanup_dist_env_and_memory,
+        ensure_model_parallel_initialized,
+        init_distributed_environment,
+        model_parallel_is_initialized,
+    )
+    from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQLinearMethod
+    from vllm.model_executor.model_loader import get_model
+    from vllm.v1.worker.workspace import (
+        init_workspace_manager,
+        is_workspace_manager_initialized,
+    )
+
+    h_dim, dense_i, moe_i, e_cnt, topk = 256, 256, 256, 4, 2
+    w_bits_l1 = (4, 8, 4, 8)
+    model_dir = tmp_path / ("ds2_gptq_sh_w4" if quantize_shared else "ds2_gptq_sh_fp16")
+    model_dir.mkdir()
+
+    gen = torch.Generator(device="cpu").manual_seed(515)
+    s_in_1 = torch.where(torch.randint(0, 2, (h_dim,), generator=gen) == 0, -1, 1).to(torch.int8)
+    s_mid_1 = torch.where(torch.randint(0, 2, (moe_i,), generator=gen) == 0, -1, 1).to(torch.int8)
+    save_file(
+        {"layer.1.s_in": s_in_1, "layer.1.s_mid": s_mid_1},
+        str(model_dir / "dxmoe_signs.safetensors"),
+    )
+
+    qcfg_doc: dict = {
+        "bits": 4,
+        "group_size": -1,
+        "sym": True,
+        "desc_act": False,
+        "quant_method": "gptq",
+        "checkpoint_format": "gptq",
+        "modules_in_block_to_quantize": ["mlp.experts."]
+        + (["mlp.shared_experts."] if quantize_shared else []),
+        "lm_head": False,
+        "dynamic": {
+            r"+:^model\.layers\.1\.mlp\.experts\.(1|3)\.(gate_proj|up_proj|down_proj)$": {"bits": 8},
+            **({r"+:.*mlp\.shared_experts\..*": {"bits": 4, "group_size": 128}} if quantize_shared else {}),
+        },
+    }
+    hf_cfg = {
+        "architectures": ["DeepseekV2ForCausalLM"],
+        "model_type": "deepseek_v2",
+        "vocab_size": 128,
+        "hidden_size": h_dim,
+        "intermediate_size": dense_i,
+        "moe_intermediate_size": moe_i,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "n_shared_experts": 1,
+        "n_routed_experts": e_cnt,
+        "num_experts_per_tok": topk,
+        "first_k_dense_replace": 1,
+        "moe_layer_freq": 1,
+        "q_lora_rank": None,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "scoring_func": "softmax",
+        "topk_method": "greedy",
+        "n_group": 1,
+        "topk_group": 1,
+        "norm_topk_prob": True,
+        "routed_scaling_factor": 1.0,
+        "rms_norm_eps": 1e-6,
+        "max_position_embeddings": 256,
+        "torch_dtype": "bfloat16",
+        "tie_word_embeddings": False,
+        "quantization_config": qcfg_doc,
+    }
+    (model_dir / "config.json").write_text(json.dumps(hf_cfg, indent=2), encoding="utf-8")
+
+    st: dict[str, torch.Tensor] = {
+        "model.embed_tokens.weight": (torch.randn((128, h_dim), generator=gen) * 0.02).to(torch.bfloat16),
+        "model.norm.weight": torch.ones((h_dim,), dtype=torch.bfloat16),
+        "lm_head.weight": (torch.randn((128, h_dim), generator=gen) * 0.02).to(torch.bfloat16),
+    }
+    for l_idx in range(2):
+        pfx = f"model.layers.{l_idx}"
+        st[f"{pfx}.input_layernorm.weight"] = torch.ones((h_dim,), dtype=torch.bfloat16)
+        st[f"{pfx}.post_attention_layernorm.weight"] = torch.ones((h_dim,), dtype=torch.bfloat16)
+        st[f"{pfx}.self_attn.q_proj.weight"] = (torch.randn((2 * 192, h_dim), generator=gen) * 0.02).to(torch.bfloat16)
+        st[f"{pfx}.self_attn.kv_a_proj_with_mqa.weight"] = (torch.randn((512 + 64, h_dim), generator=gen) * 0.02).to(torch.bfloat16)
+        st[f"{pfx}.self_attn.kv_a_layernorm.weight"] = torch.ones((512,), dtype=torch.bfloat16)
+        st[f"{pfx}.self_attn.kv_b_proj.weight"] = (torch.randn((2 * (128 + 128), 512), generator=gen) * 0.02).to(torch.bfloat16)
+        st[f"{pfx}.self_attn.o_proj.weight"] = (torch.randn((h_dim, 2 * 128), generator=gen) * 0.02).to(torch.bfloat16)
+
+    # Layer 0 dense MLP
+    for proj, (n_d, k_d) in (("gate_proj", (dense_i, h_dim)), ("up_proj", (dense_i, h_dim)), ("down_proj", (h_dim, dense_i))):
+        st[f"model.layers.0.mlp.{proj}.weight"] = (torch.randn((n_d, k_d), generator=gen) * 0.02).to(torch.bfloat16)
+
+    # Layer 1 MoE router + mixed W4/W8 GPTQ routed experts + shared_experts
+    st["model.layers.1.mlp.gate.weight"] = (torch.randn((e_cnt, h_dim), generator=gen) * 0.2).to(torch.bfloat16)
+    experts_meta = {}
+    routed_deq: dict[tuple[int, str], torch.Tensor] = {}
+    for e_idx, bw in enumerate(w_bits_l1):
+        lo, hi = (-8, 8) if bw == 4 else (-127, 128)
+        exp_entry = {}
+        for slot, proj, (n_d, k_d) in (
+            ("gate", "gate_proj", (moe_i, h_dim)),
+            ("up", "up_proj", (moe_i, h_dim)),
+            ("down", "down_proj", (h_dim, moe_i)),
+        ):
+            q_s = torch.randint(lo, hi, (n_d, k_d), generator=gen, dtype=torch.int16)
+            sc = (torch.rand((n_d,), generator=gen, dtype=torch.float32) * 0.01 + 0.002).to(torch.float16)
+            pkg = _pack_sym_gptq_matrix(q_s, sc, bw, group_size=-1)
+            for suf, t in pkg.items():
+                st[f"model.layers.1.mlp.experts.{e_idx}.{proj}.{suf}"] = t
+            w_deq = q_s.to(torch.float32) * sc.to(torch.float32).unsqueeze(-1)
+            routed_deq[(e_idx, slot)] = w_deq
+            beta = float(w_deq.to(torch.float64).square().sum().item() / 12.0)
+            exp_entry[slot] = {"w_bits": bw, "beta": beta}
+        exp_entry["entry"] = {
+            "w_bits": bw,
+            "beta": 0.5 * (exp_entry["gate"]["beta"] + exp_entry["up"]["beta"]),
+        }
+        experts_meta[str(e_idx)] = exp_entry
+
+    shared_deq: dict[str, torch.Tensor] = {}
+    for slot, proj, (n_d, k_d) in (
+        ("gate", "gate_proj", (moe_i, h_dim)),
+        ("up", "up_proj", (moe_i, h_dim)),
+        ("down", "down_proj", (h_dim, moe_i)),
+    ):
+        if quantize_shared:
+            q_s = torch.randint(-8, 8, (n_d, k_d), generator=gen, dtype=torch.int16)
+            sc_g = (torch.rand((k_d // 128, n_d), generator=gen, dtype=torch.float32) * 0.01 + 0.002).to(torch.float16)
+            pkg_sh = _pack_sym_gptq_matrix(q_s, sc_g, 4, group_size=128)
+            for suf, t in pkg_sh.items():
+                st[f"model.layers.1.mlp.shared_experts.{proj}.{suf}"] = t
+            w_deq = (
+                q_s.to(torch.float32).reshape(n_d, k_d // 128, 128)
+                * sc_g.transpose(0, 1).to(torch.float32).unsqueeze(-1)
+            ).reshape(n_d, k_d)
+            shared_deq[slot] = w_deq.to(torch.bfloat16)
+        else:
+            w_fp = (torch.randn((n_d, k_d), generator=gen) * 0.03).to(torch.bfloat16)
+            st[f"model.layers.1.mlp.shared_experts.{proj}.weight"] = w_fp
+            shared_deq[slot] = w_fp
+
+    save_file(st, str(model_dir / "model.safetensors"))
+    meta_doc = {
+        "format": "scaling-moe.dxmoe.meta",
+        "version": 1,
+        "base_model_type": "deepseek_v2",
+        "quantization": {"group_size": -1, "sym": True, "checkpoint_format": "gptq"},
+        "hadamard": {"mode": "block128", "block_size": 128, "seed": 42, "signs_file": "dxmoe_signs.safetensors"},
+        "layers": {
+            "1": {
+                "hidden_size": h_dim,
+                "moe_intermediate_size": moe_i,
+                "num_experts": e_cnt,
+                "top_k": topk,
+                "experts": experts_meta,
+                "thresholds": {"5.0": {"tau_entry": [0.02, 0.25], "tau_down": [0.03, 0.35]}},
+            }
+        },
+    }
+    (model_dir / "dxmoe_meta.json").write_text(json.dumps(meta_doc, indent=2), encoding="utf-8")
+
+    vllm_cfg = VllmConfig(
+        model_config=ModelConfig(
+            model=str(model_dir),
+            tokenizer=str(model_dir),
+            dtype="bfloat16",
+            quantization="dxmoe",
+            max_model_len=128,
+            enforce_eager=True,
+            skip_tokenizer_init=True,
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1,
+            max_num_batched_tokens=128,
+            max_model_len=128,
+            is_encoder_decoder=False,
+        ),
+        kernel_config=KernelConfig(moe_backend="dxmoe"),
+    )
+    device = torch.device("cuda:0")
+    if not is_workspace_manager_initialized():
+        init_workspace_manager(device)
+    need_cleanup = False
+    try:
+        with set_current_vllm_config(vllm_cfg):
+            if not model_parallel_is_initialized():
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.bind(("127.0.0.1", 0))
+                    free_port = sock.getsockname()[1]
+                init_distributed_environment(
+                    world_size=1,
+                    rank=0,
+                    distributed_init_method=f"tcp://127.0.0.1:{free_port}",
+                    local_rank=0,
+                    backend="nccl",
+                )
+                need_cleanup = True
+                ensure_model_parallel_initialized(1, 1)
+            model = get_model(vllm_config=vllm_cfg)
+        model.eval()
+
+        moe_mlp = model.model.layers[1].mlp
+        routed_qm = moe_mlp.experts.routed_experts.quant_method
+        assert isinstance(routed_qm, DxMoEMoEMethod)
+        assert routed_qm.checkpoint_is_gptq is True
+        # Proxy qweight/scales/qzeros params removed after loading; 0-byte w13/w2 placeholders remain
+        assert moe_mlp.experts.routed_experts.w13_weight.numel() == 0
+        assert not hasattr(moe_mlp.experts.routed_experts, "w13_qweight")
+
+        sh_gu_qm = moe_mlp.shared_experts.gate_up_proj.quant_method
+        if quantize_shared:
+            assert isinstance(sh_gu_qm, AutoGPTQLinearMethod)
+            assert sh_gu_qm.input_dtype is None
+        else:
+            assert isinstance(sh_gu_qm, UnquantizedLinearMethod)
+
+        x_in = (torch.randn((8, h_dim), generator=gen) * 0.5).to(device=device, dtype=torch.bfloat16)
+        pos = torch.arange(8, dtype=torch.int64, device=device)
+        seq_lens = torch.tensor([8], dtype=torch.int32, device=device)
+        pad = torch.zeros((8,), dtype=torch.bool, device=device)
+        with (
+            torch.no_grad(),
+            set_forward_context(
+                None,
+                vllm_cfg,
+                num_tokens=8,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                is_padding=pad,
+                positions=pos,
+                seq_lens=seq_lens,
+            ),
+        ):
+            out_moe = moe_mlp(x_in)
+        vllm_dxmoe.check_dxmoe_workspaces_healthy(device)
+        assert out_moe.shape == (8, h_dim)
+        assert bool(torch.isfinite(out_moe).all())
+    finally:
+        if need_cleanup:
+            cleanup_dist_env_and_memory()
