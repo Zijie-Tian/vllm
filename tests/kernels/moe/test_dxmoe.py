@@ -46,6 +46,7 @@ from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.dxmoe import (
     DxMoEConfig,
     DxMoEMoEMethod,
+    prepare_shared_ffn_rotation,
 )
 from vllm.utils import dxmoe as vllm_dxmoe
 
@@ -282,6 +283,124 @@ def test_dxmoe_config_rejects_missing_layer_w16_w8a4_and_invalid_deployment() ->
         with pytest.raises(ValueError, match="moe_backend in \\('auto', 'dxmoe'\\)"):
             DxMoEConfig(base_meta)._ensure_resolved()
 
+
+def test_dxmoe_shared_ffn_rotation_is_explicit_and_uses_shared_mid_signs(
+    tmp_path: Path,
+) -> None:
+    model_dir = tmp_path / "rotated"
+    model_dir.mkdir()
+    meta = _sample_dxmoe_meta(
+        layers=(1,), hidden_size=256, inter_size=128, hadamard_mode="block128"
+    )
+    meta["layers"]["1"]["shared_ffn_rotated"] = True
+    (model_dir / "dxmoe_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    gen = torch.Generator(device="cpu").manual_seed(123)
+    s_in = torch.where(
+        torch.randint(0, 2, (256,), generator=gen) == 0, -1, 1
+    ).to(torch.int8)
+    s_mid = torch.where(
+        torch.randint(0, 2, (128,), generator=gen) == 0, -1, 1
+    ).to(torch.int8)
+    s_mid_shared = torch.where(
+        torch.randint(0, 2, (256,), generator=gen) == 0, -1, 1
+    ).to(torch.int8)
+    save_file(
+        {
+            "layer.1.s_in": s_in,
+            "layer.1.s_mid": s_mid,
+            "layer.1.s_mid_shared": s_mid_shared,
+        },
+        str(model_dir / "dxmoe_signs.safetensors"),
+    )
+
+    rotation = prepare_shared_ffn_rotation(
+        DxMoEConfig({"_model_dir": str(model_dir)}),
+        "model.layers.1.mlp.shared_experts",
+        hidden_size=256,
+        intermediate_size=256,
+    )
+    assert rotation is not None
+    x = torch.randn((3, 256), generator=gen, dtype=torch.bfloat16)
+    actual = rotation.intermediate(x)
+    base = torch.ones((1, 1), dtype=torch.float64)
+    while base.shape[0] < 128:
+        base = torch.cat(
+            (torch.cat((base, base), dim=1), torch.cat((base, -base), dim=1)),
+            dim=0,
+        )
+    had = (base / (128.0**0.5)).to(torch.float32)
+    expected = (
+        (x.float() * s_mid_shared.float()).reshape(3, 2, 128) @ had
+    ).reshape_as(x).to(x.dtype)
+    assert torch.equal(actual, expected)
+
+    # Qwen's scalar gate must still observe the original, unrotated input.
+    from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP
+
+    class _PairLinear(torch.nn.Module):
+        def __init__(self, weight: torch.Tensor) -> None:
+            super().__init__()
+            self.register_buffer("weight", weight)
+
+        def forward(self, value: torch.Tensor):
+            return F.linear(value, self.weight), None
+
+    class _SiluAndMul(torch.nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            gate, up = value.chunk(2, dim=-1)
+            return F.silu(gate) * up
+
+    class _RecordingGate(_PairLinear):
+        last_input: torch.Tensor | None = None
+
+        def forward(self, value: torch.Tensor):
+            self.last_input = value
+            return super().forward(value)
+
+    qwen = Qwen2MoeMLP.__new__(Qwen2MoeMLP)
+    torch.nn.Module.__init__(qwen)
+    qwen.gate_up_proj = _PairLinear(torch.randn((512, 256), generator=gen))
+    qwen.down_proj = _PairLinear(torch.randn((256, 256), generator=gen))
+    qwen.act_fn = _SiluAndMul()
+    qwen.expert_gate = _RecordingGate(torch.randn((1, 256), generator=gen))
+    qwen._dxmoe_shared_rotation = rotation
+    x_f32 = torch.randn((2, 256), generator=gen)
+    qwen_out = qwen(x_f32)
+    x_rot = rotation.input(x_f32)
+    gate_up = F.linear(x_rot, qwen.gate_up_proj.weight)
+    gate, up = gate_up.chunk(2, dim=-1)
+    hidden_rot = rotation.intermediate(F.silu(gate) * up)
+    expected_qwen = F.linear(hidden_rot, qwen.down_proj.weight)
+    expected_qwen *= torch.sigmoid(F.linear(x_f32, qwen.expert_gate.weight))
+    assert torch.equal(qwen_out, expected_qwen)
+    assert qwen.expert_gate.last_input is x_f32
+
+    legacy_meta = copy.deepcopy(meta)
+    legacy_meta["layers"]["1"].pop("shared_ffn_rotated")
+    (model_dir / "dxmoe_meta.json").write_text(
+        json.dumps(legacy_meta), encoding="utf-8"
+    )
+    legacy = prepare_shared_ffn_rotation(
+        DxMoEConfig({"_model_dir": str(model_dir)}),
+        "model.layers.1.mlp.shared_experts",
+        hidden_size=256,
+        intermediate_size=256,
+    )
+    assert legacy is None
+
+    save_file(
+        {"layer.1.s_in": s_in, "layer.1.s_mid": s_mid},
+        str(model_dir / "dxmoe_signs.safetensors"),
+    )
+    (model_dir / "dxmoe_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    with pytest.raises(ValueError, match="s_mid_shared is missing"):
+        prepare_shared_ffn_rotation(
+            DxMoEConfig({"_model_dir": str(model_dir)}),
+            "model.layers.1.mlp.shared_experts",
+            hidden_size=256,
+            intermediate_size=256,
+        )
 
 def test_dxmoe_method_rejects_topk_mismatch_and_nonstandard_routers() -> None:
     spec = DxMoEConfig(_sample_dxmoe_meta(layers=(1,), top_k=2))._ensure_resolved()[1]

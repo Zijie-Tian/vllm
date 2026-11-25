@@ -134,9 +134,11 @@ def _load_signs_from_safetensors(
                 len(parts) != 3
                 or parts[0] != "layer"
                 or not parts[1].isdigit()
-                or parts[2] not in ("s_in", "s_mid")
+                or parts[2] not in ("s_in", "s_mid", "s_mid_shared")
             ):
                 raise ValueError(f"Unexpected tensor key in {signs_path}: {key!r}")
+            if parts[2] == "s_mid_shared":
+                continue
             l_idx = int(parts[1])
             vec = reader.get_tensor(key).detach().to(device="cpu", dtype=torch.int8).contiguous()
             if vec.ndim != 1 or not bool(((vec == -1) | (vec == 1)).all()):
@@ -153,6 +155,129 @@ def _load_signs_from_safetensors(
     return {idx: (s_in_map[idx], s_mid_map[idx]) for idx in sorted(expected_layers)}
 
 
+def _load_shared_mid_signs(signs_path: Path) -> dict[int, torch.Tensor]:
+    found: dict[int, torch.Tensor] = {}
+    if not signs_path.is_file():
+        return found
+    with safe_open(str(signs_path), framework="pt", device="cpu") as reader:
+        for key in reader.keys():
+            parts = key.split(".")
+            if (
+                len(parts) == 3
+                and parts[0] == "layer"
+                and parts[1].isdigit()
+                and parts[2] == "s_mid_shared"
+            ):
+                vec = (
+                    reader.get_tensor(key)
+                    .detach()
+                    .to(device="cpu", dtype=torch.int8)
+                    .contiguous()
+                )
+                if vec.ndim != 1 or not bool(((vec == -1) | (vec == 1)).all()):
+                    raise ValueError(f"Invalid +/-1 sign vector {key!r} in {signs_path}")
+                found[int(parts[1])] = vec
+    return found
+
+
+def _normalized_hadamard_128(device: torch.device) -> torch.Tensor:
+    """Build the normalized Sylvester H128 once, outside model forward."""
+    base = torch.ones((1, 1), dtype=torch.float64)
+    size = 1
+    while size < 128:
+        base = torch.cat(
+            (torch.cat((base, base), dim=1), torch.cat((base, -base), dim=1)),
+            dim=0,
+        )
+        size *= 2
+    return (base / math.sqrt(128.0)).to(device=device, dtype=torch.float32)
+
+
+class DxMoESharedFFNRotation(torch.nn.Module):
+    """Device-resident block128 rotation used by one shared FFN."""
+
+    def __init__(self, s_in: torch.Tensor, s_mid: torch.Tensor) -> None:
+        super().__init__()
+        device = torch.get_default_device()
+        self.register_buffer(
+            "s_in", s_in.to(device=device, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "s_mid", s_mid.to(device=device, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "hadamard", _normalized_hadamard_128(device), persistent=False
+        )
+
+    def _apply_rotation(self, x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
+        dim = x.shape[-1]
+        if dim % 128 != 0 or signs.numel() != dim:
+            raise ValueError(
+                f"shared Hadamard dim {dim} does not match signs {tuple(signs.shape)}"
+            )
+        if signs.device != x.device or self.hadamard.device != x.device:
+            raise RuntimeError(
+                "DxMoE shared Hadamard buffers must be on the activation device"
+            )
+        signed = x.to(dtype=torch.float32) * signs
+        blocks = signed.reshape(*x.shape[:-1], dim // 128, 128)
+        return torch.matmul(blocks, self.hadamard).reshape(x.shape).to(dtype=x.dtype)
+
+    def input(self, x: torch.Tensor) -> torch.Tensor:
+        return self._apply_rotation(x, self.s_in)
+
+    def intermediate(self, x: torch.Tensor) -> torch.Tensor:
+        return self._apply_rotation(x, self.s_mid)
+
+
+def prepare_shared_ffn_rotation(
+    quant_config: Any,
+    prefix: str,
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+) -> DxMoESharedFFNRotation | None:
+    """Create shared rotation buffers only for explicitly marked new artifacts."""
+    if not isinstance(quant_config, DxMoEConfig):
+        return None
+    if "shared_expert" not in prefix:
+        return None
+    match = re.search(r"layers\.(\d+)", prefix)
+    if match is None:
+        raise ValueError(f"Cannot parse layer index from shared FFN prefix {prefix!r}")
+    layer_idx = int(match.group(1))
+    quant_config._ensure_resolved()
+    if not quant_config.shared_ffn_rotated_layers.get(layer_idx, False):
+        return None
+    if quant_config.hadamard_mode != "block128":
+        raise ValueError(
+            f"Layer {layer_idx} marks shared_ffn_rotated without block128 Hadamard"
+        )
+    pair = quant_config.signs_by_layer.get(layer_idx)
+    if pair is None:
+        raise ValueError(f"Layer {layer_idx} rotated shared FFN is missing s_in/s_mid")
+    s_in, s_mid = pair
+    if s_in.numel() != hidden_size:
+        raise ValueError(
+            f"Layer {layer_idx} shared hidden size {hidden_size} != s_in length {s_in.numel()}"
+        )
+    if intermediate_size == s_mid.numel():
+        selected_mid = s_mid
+    else:
+        selected_mid = quant_config.shared_mid_signs.get(layer_idx)
+        if selected_mid is None:
+            raise ValueError(
+                f"Layer {layer_idx} shared intermediate size {intermediate_size} differs "
+                f"from routed size {s_mid.numel()} but s_mid_shared is missing"
+            )
+        if selected_mid.numel() != intermediate_size:
+            raise ValueError(
+                f"Layer {layer_idx} shared intermediate size {intermediate_size} != "
+                f"s_mid_shared length {selected_mid.numel()}"
+            )
+    return DxMoESharedFFNRotation(s_in, selected_mid)
+
+
 class DxMoEConfig(QuantizationConfig):
     """QuantizationConfig loading `dxmoe_meta.json` + `dxmoe_signs.safetensors`."""
 
@@ -167,6 +292,10 @@ class DxMoEConfig(QuantizationConfig):
         self._hf_gptq_raw_cfg: dict[str, Any] | None = None
         self._explicit_model_name: str | None = None
         self._explicit_revision: str | None = None
+        self.hadamard_mode = "none"
+        self.signs_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.shared_mid_signs: dict[int, torch.Tensor] = {}
+        self.shared_ffn_rotated_layers: dict[int, bool] = {}
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -565,10 +694,26 @@ class DxMoEConfig(QuantizationConfig):
                     "VLLM_DXMOE_SIGNS_PATH"
                 )
             signs_by_layer = _load_signs_from_safetensors(signs_path, expected_layer_ids)
+            self.shared_mid_signs = _load_shared_mid_signs(signs_path)
+        else:
+            self.shared_mid_signs = {}
+        self.hadamard_mode = had_mode
+        self.signs_by_layer = signs_by_layer
 
         specs: dict[int, _ParsedDxMoELayerSpec] = {}
         for l_str, l_meta in layers_dict.items():
             l_idx = int(l_str)
+            shared_ffn_rotated = l_meta.get("shared_ffn_rotated", False)
+            if type(shared_ffn_rotated) is not bool:
+                raise ValueError(
+                    f"Layer {l_idx} shared_ffn_rotated must be a boolean, "
+                    f"got {shared_ffn_rotated!r}"
+                )
+            if shared_ffn_rotated and had_mode != "block128":
+                raise ValueError(
+                    f"Layer {l_idx} shared_ffn_rotated requires hadamard.mode=block128"
+                )
+            self.shared_ffn_rotated_layers[l_idx] = shared_ffn_rotated
             hidden_size = int(l_meta["hidden_size"])
             inter_size = int(l_meta["moe_intermediate_size"])
             num_experts = int(l_meta["num_experts"])

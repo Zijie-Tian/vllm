@@ -111,10 +111,24 @@ class Qwen2MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.expert_gate = expert_gate
+        from vllm.model_executor.layers.quantization.dxmoe import (
+            prepare_shared_ffn_rotation,
+        )
+
+        self._dxmoe_shared_rotation = prepare_shared_ffn_rotation(
+            quant_config,
+            prefix,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
+        rotation = self._dxmoe_shared_rotation
+        proj_in = rotation.input(x) if rotation is not None else x
+        gate_up, _ = self.gate_up_proj(proj_in)
         out = self.act_fn(gate_up)
+        if rotation is not None:
+            out = rotation.intermediate(out)
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:

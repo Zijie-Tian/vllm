@@ -280,12 +280,26 @@ class DeepseekV2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        from vllm.model_executor.layers.quantization.dxmoe import (
+            prepare_shared_ffn_rotation,
+        )
+
+        self._dxmoe_shared_rotation = prepare_shared_ffn_rotation(
+            quant_config,
+            prefix,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+        rotation = self._dxmoe_shared_rotation
+        proj_in = rotation.input(x) if rotation is not None else x
+        gate_up, _ = self.gate_up_proj(proj_in)
+        hidden = self.act_fn(gate_up)
+        if rotation is not None:
+            hidden = rotation.intermediate(hidden)
+        out, _ = self.down_proj(hidden)
+        return out
 
 
 class DeepseekV2MoE(nn.Module):
