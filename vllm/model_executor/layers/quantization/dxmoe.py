@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
@@ -85,9 +86,34 @@ logger = init_logger(__name__)
 
 _DXMOE_META_FORMAT = "scaling-moe.dxmoe.meta"
 _DXMOE_THRESHOLDS_FORMAT = "scaling-moe.dxmoe.thresholds"
+_DXMOE_THRESHOLDS_SUBDIR = "thresholds"
+_DXMOE_WEIGHT_FP_SCHEMA = "scaling-moe.dxmoe.weight-fp.v2"
 _DXMOE_META_FILENAME = "dxmoe_meta.json"
 _DXMOE_SIGNS_FILENAME = "dxmoe_signs.safetensors"
 _LAYER_IDX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+_SHA256_PREFIX_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_FORBIDDEN_V2_KEYS = frozenset(
+    {
+        "model",
+        "model_dir",
+        "out_dir",
+        "path",
+        "file_path",
+        "elapsed_s",
+        "elapsed_seconds",
+        "timestamp",
+        "created_at",
+        "updated_at",
+        "hostname",
+        "host",
+        "runs",
+        "counts",
+        "entry_counts",
+        "down_counts",
+        "calib_realized",
+        "threshold_calibration",
+    }
+)
 _SUPPORTED_SM_CAPS = ((8, 0), (8, 6))
 _SUPPORTED_ROUTING_METHODS = (
     RoutingMethodType.Default,
@@ -190,6 +216,293 @@ def _load_shared_mid_signs(signs_path: Path) -> dict[int, torch.Tensor]:
                     raise ValueError(f"Invalid +/-1 sign vector {key!r} in {signs_path}")
                 found[int(parts[1])] = vec
     return found
+
+
+def _fmt_nonneg_f64(value: Any, label: str) -> str:
+    if (
+        type(value) is bool
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0.0
+    ):
+        raise ValueError(f"{label} must be finite and non-negative, got {value!r}")
+    norm = 0.0 if value == 0 else float(value)
+    return f"{norm:.17g}"
+
+
+def _canonical_shared_ffn(shared_ffn: Any) -> list[list[Any]] | None:
+    if shared_ffn is None:
+        return None
+    if not isinstance(shared_ffn, dict):
+        raise ValueError(f"shared_ffn must be None or a dict, got {type(shared_ffn).__name__}")
+    out: list[list[Any]] = []
+    for cname in sorted(shared_ffn):
+        cval = shared_ffn[cname]
+        if not isinstance(cval, dict):
+            raise ValueError(f"shared_ffn[{cname!r}] must be a dict")
+        projs: list[list[Any]] = []
+        for pname in sorted(cval):
+            pinfo = cval[pname]
+            if not isinstance(pinfo, dict) or type(pinfo.get("w_bits")) is not int:
+                raise ValueError(f"shared_ffn[{cname!r}][{pname!r}] missing int w_bits")
+            projs.append([str(pname), int(pinfo["w_bits"])])
+        out.append([str(cname), projs])
+    return out
+
+
+def _sign_vec_hex(vec: torch.Tensor, expected_len: int | None, label: str) -> str:
+    cpu = vec.detach().to(device="cpu", dtype=torch.int8).contiguous()
+    if cpu.ndim != 1 or cpu.numel() == 0 or not bool(((cpu == -1) | (cpu == 1)).all()):
+        raise ValueError(f"Invalid +/-1 sign vector {label}")
+    if expected_len is not None and cpu.numel() != expected_len:
+        raise ValueError(f"{label} length {cpu.numel()} != expected {expected_len}")
+    return bytes(cpu.view(torch.uint8).tolist()).hex()
+
+
+def _compute_dxmoe_weight_fingerprint(
+    meta: dict[str, Any],
+    signs_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    shared_mid_signs: dict[int, torch.Tensor],
+) -> str:
+    """Compute canonical `sha256:<64-hex>` static weight fingerprint identical to scaling_moe."""
+    had = meta.get("hadamard", {})
+    quant = meta.get("quantization", {})
+    had_mode = str(had.get("mode", "none"))
+    had_block_size = int(had["block_size"]) if had_mode == "block128" else None
+    group_size = int(quant["group_size"])
+    sym = bool(quant["sym"])
+
+    canonical_layers: list[dict[str, Any]] = []
+    for l_idx, l_meta in sorted(
+        ((int(k), v) for k, v in meta["layers"].items()), key=lambda kv: kv[0]
+    ):
+        h_size = int(l_meta["hidden_size"])
+        i_size = int(l_meta["moe_intermediate_size"])
+        n_exp = int(l_meta["num_experts"])
+        top_k = int(l_meta["top_k"])
+        shared_rot = bool(l_meta.get("shared_ffn_rotated", False))
+        experts_in = l_meta["experts"]
+        exp_rows: list[list[Any]] = []
+        for e_idx in range(n_exp):
+            ed = experts_in[str(e_idx)]
+            exp_rows.append(
+                [
+                    int(ed["gate"]["w_bits"]),
+                    _fmt_nonneg_f64(ed["gate"]["beta"], f"Layer {l_idx} expert {e_idx} beta"),
+                    int(ed["up"]["w_bits"]),
+                    _fmt_nonneg_f64(ed["up"]["beta"], f"Layer {l_idx} expert {e_idx} beta"),
+                    int(ed["entry"]["w_bits"]),
+                    _fmt_nonneg_f64(ed["entry"]["beta"], f"Layer {l_idx} expert {e_idx} beta"),
+                    int(ed["down"]["w_bits"]),
+                    _fmt_nonneg_f64(ed["down"]["beta"], f"Layer {l_idx} expert {e_idx} beta"),
+                ]
+            )
+        canonical_layers.append(
+            {
+                "layer": l_idx,
+                "hidden_size": h_size,
+                "moe_intermediate_size": i_size,
+                "num_experts": n_exp,
+                "top_k": top_k,
+                "shared_ffn_rotated": shared_rot,
+                "shared_ffn": _canonical_shared_ffn(l_meta.get("shared_ffn")),
+                "experts": exp_rows,
+            }
+        )
+
+    header = {
+        "schema": _DXMOE_WEIGHT_FP_SCHEMA,
+        "hadamard_mode": had_mode,
+        "hadamard_block_size": had_block_size,
+        "group_size": group_size,
+        "sym": sym,
+        "layers": canonical_layers,
+    }
+    hasher = hashlib.sha256()
+    hasher.update(
+        json.dumps(header, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    )
+    if had_mode == "block128":
+        for l_entry in canonical_layers:
+            l_idx = l_entry["layer"]
+            s_in, s_mid = signs_by_layer[l_idx]
+            s_in_hex = _sign_vec_hex(s_in, l_entry["hidden_size"], f"layer.{l_idx}.s_in")
+            s_mid_hex = _sign_vec_hex(
+                s_mid, l_entry["moe_intermediate_size"], f"layer.{l_idx}.s_mid"
+            )
+            if l_entry["shared_ffn_rotated"] and l_idx in shared_mid_signs:
+                s_sh_hex = _sign_vec_hex(
+                    shared_mid_signs[l_idx], None, f"layer.{l_idx}.s_mid_shared"
+                )
+            else:
+                s_sh_hex = ""
+            hasher.update(
+                f"|L{l_idx}:in={s_in_hex}:mid={s_mid_hex}:sh={s_sh_hex}".encode("ascii")
+            )
+    return f"sha256:{hasher.hexdigest()}"
+
+
+def _format_pct_token(ratio: float) -> str:
+    pct = round(float(ratio) * 100.0, 6)
+    if abs(pct - round(pct)) < 1e-9:
+        return str(int(round(pct)))
+    return f"{pct:.6f}".rstrip("0").rstrip(".")
+
+
+def _format_ratio_tag(ratios: list[Any] | tuple[Any, ...]) -> str:
+    return (
+        f"r{_format_pct_token(float(ratios[0]))}-"
+        f"{_format_pct_token(float(ratios[1]))}-"
+        f"{_format_pct_token(float(ratios[2]))}"
+    )
+
+
+def _check_no_forbidden_v2_keys(node: Any, path: str = "$") -> None:
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in _FORBIDDEN_V2_KEYS:
+                raise ValueError(
+                    f"Forbidden non-deterministic or legacy field {k!r} at {path}.{k} "
+                    "in v2 thresholds JSON"
+                )
+            _check_no_forbidden_v2_keys(v, f"{path}.{k}")
+    elif isinstance(node, list):
+        for idx, item in enumerate(node):
+            _check_no_forbidden_v2_keys(item, f"{path}[{idx}]")
+
+
+def _validate_tau_pair(raw_pair: Any, l_idx: int, stage_name: str) -> tuple[float, float]:
+    if not isinstance(raw_pair, (list, tuple)) or len(raw_pair) != 2:
+        raise ValueError(
+            f"Layer {l_idx} missing 2-element {stage_name}, got {raw_pair!r}"
+        )
+    t0 = float(raw_pair[0])
+    t1 = float(raw_pair[1])
+    if not (math.isfinite(t0) and math.isfinite(t1) and 0.0 <= t0 <= t1):
+        raise ValueError(
+            f"Layer {l_idx} invalid {stage_name}={(t0, t1)}; "
+            "expected finite 0 <= tau1 <= tau2"
+        )
+    return (t0, t1)
+
+
+def _extract_tau_from_external_doc(
+    ext_doc: Any,
+    *,
+    threshold_key: str,
+    expected_layer_ids: set[int],
+    expected_weight_fp: str,
+) -> dict[int, tuple[tuple[float, float], tuple[float, float]]]:
+    if not isinstance(ext_doc, dict):
+        raise ValueError("External DxMoE thresholds JSON must be a JSON object")
+    if "format" in ext_doc or "version" in ext_doc:
+        if ext_doc.get("format") != _DXMOE_THRESHOLDS_FORMAT or ext_doc.get(
+            "version"
+        ) not in (1, 2):
+            raise ValueError(
+                f"Expected thresholds JSON format={_DXMOE_THRESHOLDS_FORMAT!r} "
+                f"version in (1, 2), got format={ext_doc.get('format')!r} "
+                f"version={ext_doc.get('version')!r}"
+            )
+
+    if ext_doc.get("version") == 2:
+        _check_no_forbidden_v2_keys(ext_doc)
+        mspec = ext_doc.get("model_spec")
+        if not isinstance(mspec, dict):
+            raise ValueError("v2 thresholds JSON missing 'model_spec' object")
+        file_fp = mspec.get("weight_fingerprint")
+        if type(file_fp) is not str or not _SHA256_PREFIX_RE.match(file_fp):
+            raise ValueError(f"Invalid v2 model_spec.weight_fingerprint={file_fp!r}")
+        if file_fp != expected_weight_fp:
+            raise ValueError(
+                f"DxMoE threshold weight_fingerprint mismatch: threshold file has {file_fp}, "
+                f"but loaded model has {expected_weight_fp}"
+            )
+        layers_v2 = ext_doc.get("layers")
+        if not isinstance(layers_v2, dict):
+            raise ValueError("v2 thresholds JSON 'layers' must be a JSON object")
+        if {int(k) for k in layers_v2 if str(k).isdigit()} != expected_layer_ids:
+            raise ValueError(
+                f"v2 thresholds layers {sorted(layers_v2)} do not match "
+                f"model MoE layers {sorted(expected_layer_ids)}"
+            )
+        out_v2: dict[int, tuple[tuple[float, float], tuple[float, float]]] = {}
+        for l_idx in sorted(expected_layer_ids):
+            lv = layers_v2[str(l_idx)]
+            if not isinstance(lv, dict) or set(lv) != {"tau_entry", "tau_down"}:
+                raise ValueError(
+                    f"v2 thresholds layer {l_idx} must contain exact keys "
+                    f"['tau_entry', 'tau_down'], got {lv!r}"
+                )
+            out_v2[l_idx] = (
+                _validate_tau_pair(lv["tau_entry"], l_idx, "tau_entry"),
+                _validate_tau_pair(lv["tau_down"], l_idx, "tau_down"),
+            )
+        return out_v2
+
+    # Legacy v1 external thresholds JSON
+    ext_layers = ext_doc.get("layers", ext_doc)
+    if not isinstance(ext_layers, dict):
+        raise ValueError("External DxMoE thresholds 'layers' must be a JSON object")
+    out_v1: dict[int, tuple[tuple[float, float], tuple[float, float]]] = {}
+    for l_idx in sorted(expected_layer_ids):
+        l_str = str(l_idx)
+        if l_str not in ext_layers:
+            raise ValueError(
+                f"External thresholds JSON missing layer {l_idx}; "
+                f"available layers: {sorted(ext_layers)}"
+            )
+        layer_ext = ext_layers[l_str]
+        if not isinstance(layer_ext, dict):
+            raise ValueError(f"External thresholds entry for layer {l_idx} must be a dict")
+        if "tau_entry" in layer_ext or "tau_down" in layer_ext or "tau" in layer_ext:
+            tdoc = layer_ext
+        else:
+            t_map = layer_ext.get("thresholds", layer_ext)
+            if not isinstance(t_map, dict) or threshold_key not in t_map:
+                raise ValueError(
+                    f"schedule_mode='dxmoe' requires calibrated thresholds under "
+                    f"threshold_key={threshold_key!r} for layer {l_idx}; "
+                    f"available keys: {sorted(t_map) if isinstance(t_map, dict) else []}"
+                )
+            tdoc = t_map[threshold_key]
+        raw_te = tdoc.get("tau_entry", tdoc.get("tau"))
+        raw_td = tdoc.get("tau_down", tdoc.get("tau"))
+        out_v1[l_idx] = (
+            _validate_tau_pair(raw_te, l_idx, "tau_entry"),
+            _validate_tau_pair(raw_td, l_idx, "tau_down"),
+        )
+    return out_v1
+
+
+def _matches_threshold_file_key(path: Path, doc: dict[str, Any], key: str) -> bool:
+    if key == path.name or key == path.stem:
+        return True
+    if doc.get("version") == 2:
+        prof = doc.get("profile", {})
+        if not isinstance(prof, dict):
+            return False
+        if str(prof.get("name", "")) == key:
+            return True
+        ratios = prof.get("ratios")
+        if isinstance(ratios, list) and len(ratios) == 3:
+            if _format_ratio_tag(ratios) == key:
+                return True
+            t_bits = round(
+                4.0 * float(ratios[0]) + 8.0 * float(ratios[1]) + 16.0 * float(ratios[2]),
+                6,
+            )
+            if f"b{t_bits:.2f}" == key:
+                return True
+        return False
+    ext_layers = doc.get("layers", doc)
+    if isinstance(ext_layers, dict) and ext_layers:
+        first_val = next(iter(ext_layers.values()))
+        if isinstance(first_val, dict):
+            t_map = first_val.get("thresholds", first_val)
+            if isinstance(t_map, dict) and key in t_map:
+                return True
+    return False
 
 
 def _normalized_hadamard_128(device: torch.device) -> torch.Tensor:
@@ -645,29 +958,10 @@ class DxMoEConfig(QuantizationConfig):
             os.environ.get("VLLM_DXMOE_THRESHOLD_KEY")
             or self.raw_config.get("threshold_key")
             or "5.0"
-        )
+        ).strip()
         thresholds_json_raw = os.environ.get(
             "VLLM_DXMOE_THRESHOLDS_JSON"
         ) or self.raw_config.get("thresholds_json")
-        external_thresholds: dict[str, Any] | None = None
-        if thresholds_json_raw:
-            ext_doc = json.loads(Path(str(thresholds_json_raw)).read_text(encoding="utf-8"))
-            if not isinstance(ext_doc, dict):
-                raise ValueError("External DxMoE thresholds JSON must be a JSON object")
-            if "format" in ext_doc or "version" in ext_doc:
-                if (
-                    ext_doc.get("format") != _DXMOE_THRESHOLDS_FORMAT
-                    or ext_doc.get("version") != 1
-                ):
-                    raise ValueError(
-                        f"Expected thresholds JSON format={_DXMOE_THRESHOLDS_FORMAT!r} "
-                        f"version=1, got format={ext_doc.get('format')!r} "
-                        f"version={ext_doc.get('version')!r}"
-                    )
-            ext_layers = ext_doc.get("layers", ext_doc)
-            if not isinstance(ext_layers, dict):
-                raise ValueError("External DxMoE thresholds 'layers' must be a JSON object")
-            external_thresholds = ext_layers
 
         raw_pipelined = (
             os.environ.get("VLLM_DXMOE_PIPELINED")
@@ -737,7 +1031,8 @@ class DxMoEConfig(QuantizationConfig):
         self.hadamard_mode = had_mode
         self.signs_by_layer = signs_by_layer
 
-        specs: dict[int, _ParsedDxMoELayerSpec] = {}
+        # First pass: validate per-layer geometry, static w_bits, and finite non-negative beta
+        validated_layers: dict[int, tuple[int, int, int, int, tuple[int, ...], tuple[int, ...], tuple[float, ...], tuple[float, ...]]] = {}
         for l_str, l_meta in layers_dict.items():
             l_idx = int(l_str)
             shared_ffn_rotated = l_meta.get("shared_ffn_rotated", False)
@@ -779,10 +1074,16 @@ class DxMoEConfig(QuantizationConfig):
                     )
                 w_bits_entry.append(bw_e)
                 w_bits_down.append(bw_d)
+                bg = float(ed["gate"]["beta"])
+                bu = float(ed["up"]["beta"])
                 be = float(ed["entry"]["beta"])
                 bd = float(ed["down"]["beta"])
                 if not (
-                    math.isfinite(be)
+                    math.isfinite(bg)
+                    and bg >= 0.0
+                    and math.isfinite(bu)
+                    and bu >= 0.0
+                    and math.isfinite(be)
                     and be >= 0.0
                     and math.isfinite(bd)
                     and bd >= 0.0
@@ -794,8 +1095,98 @@ class DxMoEConfig(QuantizationConfig):
                 beta_entry.append(be)
                 beta_down.append(bd)
 
-            has_w8_entry = any(b == 8 for b in w_bits_entry)
-            has_w8_down = any(b == 8 for b in w_bits_down)
+            s_in_cpu, s_mid_cpu = signs_by_layer.get(l_idx, (None, None))
+            if s_in_cpu is not None and s_in_cpu.numel() != hidden_size:
+                raise ValueError(
+                    f"Layer {l_idx} s_in length {s_in_cpu.numel()} != {hidden_size}"
+                )
+            if s_mid_cpu is not None and s_mid_cpu.numel() != inter_size:
+                raise ValueError(
+                    f"Layer {l_idx} s_mid length {s_mid_cpu.numel()} != {inter_size}"
+                )
+            validated_layers[l_idx] = (
+                hidden_size,
+                inter_size,
+                num_experts,
+                top_k,
+                tuple(w_bits_entry),
+                tuple(w_bits_down),
+                tuple(beta_entry),
+                tuple(beta_down),
+            )
+
+        weight_fp = _compute_dxmoe_weight_fingerprint(
+            meta, signs_by_layer, self.shared_mid_signs
+        )
+
+        # Three-tier threshold resolution:
+        #   1) Explicit VLLM_DXMOE_THRESHOLDS_JSON / raw_config['thresholds_json']
+        #   2) <model_dir>/thresholds/*.json auto-discovery (fail-closed on >= 2 matches)
+        #   3) Fallback to dxmoe_meta.json embedded layers[l]['thresholds'][threshold_key]
+        resolved_ext_tau: dict[int, tuple[tuple[float, float], tuple[float, float]]] | None = None
+        dir_candidates: list[str] = []
+        if thresholds_json_raw:
+            ext_doc = json.loads(Path(str(thresholds_json_raw)).read_text(encoding="utf-8"))
+            resolved_ext_tau = _extract_tau_from_external_doc(
+                ext_doc,
+                threshold_key=threshold_key,
+                expected_layer_ids=expected_layer_ids,
+                expected_weight_fp=weight_fp,
+            )
+        elif model_dir is not None and (model_dir / _DXMOE_THRESHOLDS_SUBDIR).is_dir():
+            t_dir = model_dir / _DXMOE_THRESHOLDS_SUBDIR
+            matched_files: list[tuple[Path, dict[str, Any], dict[int, tuple[tuple[float, float], tuple[float, float]]]]] = []
+            for cand in sorted(p for p in t_dir.glob("*.json") if p.is_file()):
+                dir_candidates.append(cand.name)
+                cand_doc = json.loads(cand.read_text(encoding="utf-8"))
+                if not isinstance(cand_doc, dict):
+                    raise ValueError(f"Thresholds JSON {cand} must be a JSON object")
+                # Always validate v2 integrity/fingerprint inside <model_dir>/thresholds/
+                if cand_doc.get("version") == 2:
+                    cand_tau = _extract_tau_from_external_doc(
+                        cand_doc,
+                        threshold_key=threshold_key,
+                        expected_layer_ids=expected_layer_ids,
+                        expected_weight_fp=weight_fp,
+                    )
+                else:
+                    cand_tau = {}
+                if _matches_threshold_file_key(cand, cand_doc, threshold_key):
+                    if not cand_tau:
+                        cand_tau = _extract_tau_from_external_doc(
+                            cand_doc,
+                            threshold_key=threshold_key,
+                            expected_layer_ids=expected_layer_ids,
+                            expected_weight_fp=weight_fp,
+                        )
+                    matched_files.append((cand, cand_doc, cand_tau))
+
+            if len(matched_files) > 1:
+                cand_names = [m[0].name for m in matched_files]
+                raise ValueError(
+                    f"Ambiguous DxMoE threshold_key={threshold_key!r} matched "
+                    f"{len(matched_files)} files in {t_dir}: {cand_names}; "
+                    f"set VLLM_DXMOE_THRESHOLDS_JSON or specify the exact filename stem."
+                )
+            if len(matched_files) == 1:
+                resolved_ext_tau = matched_files[0][2]
+
+        specs: dict[int, _ParsedDxMoELayerSpec] = {}
+        for l_str, l_meta in layers_dict.items():
+            l_idx = int(l_str)
+            (
+                hidden_size,
+                inter_size,
+                num_experts,
+                top_k,
+                w_bits_entry_t,
+                w_bits_down_t,
+                beta_entry_t,
+                beta_down_t,
+            ) = validated_layers[l_idx]
+
+            has_w8_entry = any(b == 8 for b in w_bits_entry_t)
+            has_w8_down = any(b == 8 for b in w_bits_down_t)
             if raw_coupling is not None:
                 coup_entry = raw_coupling
                 coup_down = raw_coupling
@@ -803,60 +1194,38 @@ class DxMoEConfig(QuantizationConfig):
                 coup_entry = schedule_mode in ("dxmoe", "static_a4")
                 coup_down = schedule_mode in ("dxmoe", "static_a4")
 
-            if external_thresholds is not None:
-                if l_str not in external_thresholds:
-                    raise ValueError(
-                        f"External thresholds JSON missing layer {l_idx}; "
-                        f"available layers: {sorted(external_thresholds)}"
-                    )
-                layer_ext = external_thresholds[l_str]
-                if not isinstance(layer_ext, dict):
-                    raise ValueError(
-                        f"External thresholds entry for layer {l_idx} must be a dict"
-                    )
-                t_map = layer_ext.get("thresholds", layer_ext)
+            if resolved_ext_tau is not None:
+                tau_entry, tau_down = resolved_ext_tau[l_idx]
             else:
                 t_map = l_meta.get("thresholds", {})
-            if not isinstance(t_map, dict):
-                raise ValueError(f"Layer {l_idx} thresholds mapping must be a dict")
-            if threshold_key in t_map:
-                tdoc = t_map[threshold_key]
-                raw_te = tdoc.get("tau_entry", tdoc.get("tau"))
-                raw_td = tdoc.get("tau_down", tdoc.get("tau"))
-                if (
-                    raw_te is None
-                    or raw_td is None
-                    or len(raw_te) != 2
-                    or len(raw_td) != 2
-                ):
-                    raise ValueError(
-                        f"Layer {l_idx} threshold_key={threshold_key!r} missing "
-                        "2-element tau_entry/tau_down"
-                    )
-                tau_entry = (float(raw_te[0]), float(raw_te[1]))
-                tau_down = (float(raw_td[0]), float(raw_td[1]))
-                for stage_name, (t0, t1) in (
-                    ("tau_entry", tau_entry),
-                    ("tau_down", tau_down),
-                ):
-                    if not (
-                        math.isfinite(t0)
-                        and math.isfinite(t1)
-                        and 0.0 <= t0 <= t1
+                if not isinstance(t_map, dict):
+                    raise ValueError(f"Layer {l_idx} thresholds mapping must be a dict")
+                if threshold_key in t_map:
+                    tdoc = t_map[threshold_key]
+                    raw_te = tdoc.get("tau_entry", tdoc.get("tau"))
+                    raw_td = tdoc.get("tau_down", tdoc.get("tau"))
+                    if (
+                        raw_te is None
+                        or raw_td is None
+                        or len(raw_te) != 2
+                        or len(raw_td) != 2
                     ):
                         raise ValueError(
-                            f"Layer {l_idx} invalid {stage_name}={(t0, t1)}; "
-                            "expected finite 0 <= tau1 <= tau2"
+                            f"Layer {l_idx} threshold_key={threshold_key!r} missing "
+                            "2-element tau_entry/tau_down"
                         )
-            elif schedule_mode == "dxmoe":
-                raise ValueError(
-                    f"schedule_mode='dxmoe' requires calibrated thresholds under "
-                    f"threshold_key={threshold_key!r} for layer {l_idx}; "
-                    f"available keys: {sorted(t_map)}"
-                )
-            else:
-                tau_entry = (0.0, 0.0)
-                tau_down = (0.0, 0.0)
+                    tau_entry = _validate_tau_pair(raw_te, l_idx, "tau_entry")
+                    tau_down = _validate_tau_pair(raw_td, l_idx, "tau_down")
+                elif schedule_mode == "dxmoe":
+                    raise ValueError(
+                        f"schedule_mode='dxmoe' requires calibrated thresholds under "
+                        f"threshold_key={threshold_key!r} for layer {l_idx}; "
+                        f"thresholds/ candidates={dir_candidates}, "
+                        f"available keys: {sorted(t_map)}"
+                    )
+                else:
+                    tau_entry = (0.0, 0.0)
+                    tau_down = (0.0, 0.0)
 
             if raw_coupling is False:
                 if schedule_mode == "static_a4" and (has_w8_entry or has_w8_down):
@@ -877,14 +1246,6 @@ class DxMoEConfig(QuantizationConfig):
                     )
 
             s_in_cpu, s_mid_cpu = signs_by_layer.get(l_idx, (None, None))
-            if s_in_cpu is not None and s_in_cpu.numel() != hidden_size:
-                raise ValueError(
-                    f"Layer {l_idx} s_in length {s_in_cpu.numel()} != {hidden_size}"
-                )
-            if s_mid_cpu is not None and s_mid_cpu.numel() != inter_size:
-                raise ValueError(
-                    f"Layer {l_idx} s_mid length {s_mid_cpu.numel()} != {inter_size}"
-                )
 
             specs[l_idx] = _ParsedDxMoELayerSpec(
                 layer_idx=l_idx,
@@ -892,10 +1253,10 @@ class DxMoEConfig(QuantizationConfig):
                 inter_size=inter_size,
                 num_experts=num_experts,
                 top_k=top_k,
-                w_bits_entry=tuple(w_bits_entry),
-                w_bits_down=tuple(w_bits_down),
-                beta_entry=tuple(beta_entry),
-                beta_down=tuple(beta_down),
+                w_bits_entry=w_bits_entry_t,
+                w_bits_down=w_bits_down_t,
+                beta_entry=beta_entry_t,
+                beta_down=beta_down_t,
                 tau_entry=tau_entry,
                 tau_down=tau_down,
                 s_in_cpu=s_in_cpu,

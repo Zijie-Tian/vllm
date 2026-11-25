@@ -509,6 +509,170 @@ def test_dxmoe_external_out_thresholds_round_trip(
         DxMoEConfig(meta)._ensure_resolved()
 
 
+def test_dxmoe_v2_thresholds_auto_discovery_fingerprint_parity_and_ambiguity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    repo_root = Path(__file__).resolve().parents[5]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    from scaling_moe.dxmoe import (
+        build_dxmoe_thresholds_v2_doc,
+        compute_dxmoe_weight_fingerprint,
+        write_threshold_v2_exclusive,
+    )
+    from vllm.model_executor.layers.quantization.dxmoe import (
+        _compute_dxmoe_weight_fingerprint as vllm_compute_fp,
+    )
+
+    model_dir = tmp_path / "v2_model"
+    model_dir.mkdir()
+    meta = _sample_dxmoe_meta(
+        layers=(1, 2),
+        hidden_size=256,
+        inter_size=128,
+        num_experts=4,
+        top_k=2,
+        w_bits=(2, 3, 4, 8),
+        hadamard_mode="block128",
+        tau_entry=(0.01, 0.02),
+        tau_down=(0.03, 0.04),
+    )
+    meta["base_model_type"] = "deepseek_v2"
+    meta["hadamard"]["seed"] = 42
+    meta["quantization"].update(
+        method="gptq",
+        checkpoint_format="gptq",
+        candidate_w_bits=[2, 3, 4, 8],
+        budget_bpw=4.25,
+        achieved_routed_bpw=4.25,
+        act_order=False,
+        damp=0.01,
+    )
+    meta["layers"]["1"]["shared_ffn_rotated"] = True
+    meta["layers"]["1"]["shared_ffn"] = {
+        "shared_experts": {
+            "gate": {"w_bits": 3, "tokens": 32},
+            "up": {"w_bits": 3, "tokens": 32},
+            "down": {"w_bits": 3, "tokens": 32},
+        }
+    }
+    (model_dir / "dxmoe_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    gen = torch.Generator(device="cpu").manual_seed(777)
+    signs_map: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    st_tensors: dict[str, torch.Tensor] = {}
+    for l_idx in (1, 2):
+        s_in = torch.where(torch.randint(0, 2, (256,), generator=gen) == 0, -1, 1).to(torch.int8)
+        s_mid = torch.where(torch.randint(0, 2, (128,), generator=gen) == 0, -1, 1).to(torch.int8)
+        signs_map[l_idx] = (s_in, s_mid)
+        st_tensors[f"layer.{l_idx}.s_in"] = s_in
+        st_tensors[f"layer.{l_idx}.s_mid"] = s_mid
+    s_sh = torch.where(torch.randint(0, 2, (256,), generator=gen) == 0, -1, 1).to(torch.int8)
+    st_tensors["layer.1.s_mid_shared"] = s_sh
+    save_file(st_tensors, str(model_dir / "dxmoe_signs.safetensors"))
+
+    # 1) Exact character-for-character weight_fingerprint parity between scaling_moe and vLLM!
+    fp_main = compute_dxmoe_weight_fingerprint(meta, signs_map, {1: s_sh})
+    fp_vllm = vllm_compute_fp(meta, signs_map, {1: s_sh})
+    assert fp_main == fp_vllm
+
+    # 2) Priority 3 fallback (before creating <model_dir>/thresholds/)
+    monkeypatch.delenv("VLLM_DXMOE_THRESHOLDS_JSON", raising=False)
+    monkeypatch.setenv("VLLM_DXMOE_THRESHOLD_KEY", "5.0")
+    specs_p3 = DxMoEConfig({"_model_dir": str(model_dir)})._ensure_resolved()
+    assert specs_p3[1].tau_entry == (0.01, 0.02)
+
+    # 3) Priority 2 auto-discovery from <model_dir>/thresholds/ across all 4 matching modes
+    v2_doc = build_dxmoe_thresholds_v2_doc(
+        meta=meta,
+        weight_fingerprint=fp_main,
+        profile_name="5.0",
+        ratios=(0.85, 0.10, 0.05),
+        realized_mac_avg_bits=5.0,
+        tau_by_layer={
+            1: ([0.625, 2.5], [0.375, 1.75]),
+            2: ([0.5, 2.0], [0.25, 1.25]),
+        },
+        nsamples=32,
+        seqlen=2048,
+        seed=42,
+        dtype="float16",
+        threshold_pool="per_stage",
+        quantile_mode="effective",
+    )
+    t_dir = model_dir / "thresholds"
+    write_threshold_v2_exclusive(
+        t_dir / "b5.00__r85-10-5__per_stage-effective.json", v2_doc
+    )
+    for q_key in ("5.0", "r85-10-5", "b5.00", "b5.00__r85-10-5__per_stage-effective"):
+        monkeypatch.setenv("VLLM_DXMOE_THRESHOLD_KEY", q_key)
+        specs_p2 = DxMoEConfig({"_model_dir": str(model_dir)})._ensure_resolved()
+        assert specs_p2[1].tau_entry == (0.625, 2.5)
+        assert specs_p2[1].tau_down == (0.375, 1.75)
+        assert specs_p2[2].tau_entry == (0.5, 2.0)
+
+    # 4) Priority 1 explicit VLLM_DXMOE_THRESHOLDS_JSON overrides Priority 2
+    p1_doc = build_dxmoe_thresholds_v2_doc(
+        meta=meta,
+        weight_fingerprint=fp_main,
+        profile_name="5.6",
+        ratios=(0.70, 0.25, 0.05),
+        realized_mac_avg_bits=5.6,
+        tau_by_layer={
+            1: ([0.125, 1.125], [0.25, 1.25]),
+            2: ([0.375, 1.375], [0.5, 1.5]),
+        },
+        nsamples=32,
+        seqlen=2048,
+        seed=42,
+        dtype="float16",
+        threshold_pool="per_stage",
+        quantile_mode="effective",
+    )
+    p1_path = write_threshold_v2_exclusive(tmp_path / "explicit_v2.json", p1_doc)
+    monkeypatch.setenv("VLLM_DXMOE_THRESHOLDS_JSON", str(p1_path))
+    specs_p1 = DxMoEConfig({"_model_dir": str(model_dir)})._ensure_resolved()
+    assert specs_p1[1].tau_entry == (0.125, 1.125)
+    monkeypatch.delenv("VLLM_DXMOE_THRESHOLDS_JSON", raising=False)
+
+    # 5) Multi-file ambiguity in <model_dir>/thresholds/ fails closed!
+    v2_raw_doc = build_dxmoe_thresholds_v2_doc(
+        meta=meta,
+        weight_fingerprint=fp_main,
+        profile_name="5.0",
+        ratios=(0.85, 0.10, 0.05),
+        realized_mac_avg_bits=5.01,
+        tau_by_layer={
+            1: ([0.7, 2.7], [0.4, 1.8]),
+            2: ([0.6, 2.1], [0.3, 1.3]),
+        },
+        nsamples=32,
+        seqlen=2048,
+        seed=42,
+        dtype="float16",
+        threshold_pool="per_stage",
+        quantile_mode="raw",
+    )
+    write_threshold_v2_exclusive(
+        t_dir / "b5.00__r85-10-5__per_stage-raw.json", v2_raw_doc
+    )
+    monkeypatch.setenv("VLLM_DXMOE_THRESHOLD_KEY", "5.0")
+    with pytest.raises(ValueError, match="Ambiguous DxMoE threshold_key='5.0' matched 2 files"):
+        DxMoEConfig({"_model_dir": str(model_dir)})._ensure_resolved()
+
+    # 6) Fingerprint mismatch fails closed!
+    bad_fp_doc = copy.deepcopy(p1_doc)
+    bad_fp_doc["model_spec"]["weight_fingerprint"] = "sha256:" + ("f" * 64)
+    bad_fp_path = tmp_path / "bad_fp_v2.json"
+    bad_fp_path.write_text(json.dumps(bad_fp_doc), encoding="utf-8")
+    monkeypatch.setenv("VLLM_DXMOE_THRESHOLDS_JSON", str(bad_fp_path))
+    with pytest.raises(ValueError, match="weight_fingerprint mismatch"):
+        DxMoEConfig({"_model_dir": str(model_dir)})._ensure_resolved()
+
+
 def _hadamard128_ref(
     x: torch.Tensor, signs: torch.Tensor, *, out_dtype: torch.dtype | None = None
 ) -> torch.Tensor:
