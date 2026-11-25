@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DxMoE offline static W4/W8 + online dynamic A4/A8/A16 quantization config & MoE method."""
+"""DxMoE offline static W2/W3/W4/W8 + online dynamic A4/A8/A16 quantization config & MoE method."""
 
 from __future__ import annotations
 
@@ -35,7 +35,11 @@ from vllm.model_executor.layers.fused_moe.experts.dxmoe_experts import (
     DxMoEMoEQuantConfig,
 )
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    LinearMethodBase,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.auto_gptq import (
     AutoGPTQConfig,
@@ -56,15 +60,23 @@ from vllm.model_executor.utils import (
 from vllm.platforms import current_platform
 from vllm.transformers_utils.config import get_safetensors_params_metadata
 from vllm.utils.dxmoe import (
+    GPTQ_SYM_QZEROS,
+    GPTQ_SYM_QZEROS_W3,
     PIPELINED_CODE,
     SCHEDULE_MODE_CODE,
+    SUPPORTED_W_BITS,
     allocate_dxmoe_weight_buffers,
+    dxmoe_packed_row_bytes,
     finalize_dxmoe_weight_channel,
+    get_dxmoe_lib_bundle,
+    get_dxmoe_wna16_linear_workspace,
     pack_dxmoe_float_matrix,
     repack_gptq_qweight_shard,
+    run_dxmoe_wna16_linear,
     validate_gptq_qzeros_shard,
     validate_gptq_scales_shard,
 )
+from vllm.utils.math_utils import round_up
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
@@ -417,8 +429,8 @@ class DxMoEConfig(QuantizationConfig):
         prefix: str,
         shard_prefixes: list[str],
         param_meta: dict[str, dict[str, Any]],
-    ) -> AutoGPTQLinearMethod:
-        """Build a WNA16 (`input_dtype=None`) Marlin GPTQ linear method for quantized non-routed Linears."""
+    ) -> LinearMethodBase:
+        """Build a WNA16 (`input_dtype=None`) GPTQ linear method for quantized non-routed Linears."""
         raw_qcfg = self._hf_gptq_raw_cfg or {}
         dynamic_cfg = raw_qcfg.get("dynamic")
         dynamic_dict = dict(dynamic_cfg) if isinstance(dynamic_cfg, dict) else {}
@@ -439,18 +451,29 @@ class DxMoEConfig(QuantizationConfig):
                 len(qw_shape) != 2
                 or len(sc_shape) != 2
                 or len(qz_shape) != 2
+                or int(qw_shape[0]) <= 0
+                or int(qw_shape[1]) <= 0
                 or int(qz_shape[1]) <= 0
-                or int(qw_shape[1]) % int(qz_shape[1]) != 0
+                or int(sc_shape[1]) != int(qw_shape[1])
+                or (int(qz_shape[1]) * 32) % int(qw_shape[1]) != 0
             ):
                 raise ValueError(
                     f"Invalid GPTQ tensor shapes for {sp!r}: qweight={qw_shape}, "
                     f"scales={sc_shape}, qzeros={qz_shape}"
                 )
-            pack_factor = int(qw_shape[1]) // int(qz_shape[1])
-            if 32 % pack_factor != 0:
-                raise ValueError(f"Unsupported GPTQ pack_factor={pack_factor} on {sp!r}")
-            bits = 32 // pack_factor
-            k_full = int(qw_shape[0]) * pack_factor
+            n_out = int(qw_shape[1])
+            qz_cols = int(qz_shape[1])
+            qw_rows = int(qw_shape[0])
+            bits = (qz_cols * 32) // n_out
+            if bits not in SUPPORTED_W_BITS or (qw_rows * 32) % bits != 0:
+                raise ValueError(
+                    f"Unsupported GPTQ bitwidth/shape (bits={bits}, qweight={qw_shape}, qzeros={qz_shape}) on {sp!r}"
+                )
+            k_full = (qw_rows * 32) // bits
+            if bits == 3 and (n_out % 32 != 0 or k_full % 32 != 0):
+                raise ValueError(
+                    f"3-bit GPTQ requires N={n_out} and K={k_full} divisible by 32 on {sp!r}"
+                )
             num_groups = int(sc_shape[0])
             if num_groups <= 0 or k_full % num_groups != 0:
                 raise ValueError(
@@ -481,6 +504,20 @@ class DxMoEConfig(QuantizationConfig):
             raise ValueError(
                 f"DxMoE WNA16 non-routed GPTQ linear ({prefix!r}) requires sym=True, got sym=False"
             )
+        if bits in (2, 3):
+            if group_size != -1:
+                raise ValueError(
+                    f"DxMoE native W{bits}A16 non-routed GPTQ linear ({prefix!r}) requires "
+                    f"channel-wise group_size=-1, got group_size={group_size}"
+                )
+            logger.info_once(
+                "DxMoE dispatching quantized non-routed linear (e.g. %s) to native W%dA16 "
+                "DxMoEWNA16LinearMethod (group_size=-1, activations strictly FP16/BF16).",
+                prefix,
+                bits,
+            )
+            return DxMoEWNA16LinearMethod(w_bits=bits, prefix=prefix)
+
         full_cfg = {
             "bits": bits,
             "group_size": group_size,
@@ -735,9 +772,9 @@ class DxMoEConfig(QuantizationConfig):
                         f"Layer {l_idx} expert {e_idx} violates gate==up==entry "
                         f"coupling: ({bw_g}, {bw_u}, {bw_e})"
                     )
-                if bw_e not in (4, 8) or bw_d not in (4, 8):
+                if bw_e not in SUPPORTED_W_BITS or bw_d not in SUPPORTED_W_BITS:
                     raise ValueError(
-                        f"Native DxMoE kernel supports W4/W8 static weights only; "
+                        f"Native DxMoE kernel supports W2/W3/W4/W8 static weights only; "
                         f"layer {l_idx} expert {e_idx} has entry=W{bw_e}, down=W{bw_d}"
                     )
                 w_bits_entry.append(bw_e)
@@ -949,8 +986,349 @@ class DxMoEConfig(QuantizationConfig):
         return None
 
 
+class DxMoEWNA16LinearMethod(LinearMethodBase):
+    """Native packed W2A16/W3A16 CUDA LinearMethod for quantized non-routed Linears (`shared_experts`)."""
+
+    def __init__(self, *, w_bits: int, prefix: str = "") -> None:
+        if w_bits not in (2, 3):
+            raise ValueError(
+                f"DxMoEWNA16LinearMethod supports w_bits in (2, 3), got {w_bits!r}"
+            )
+        self.w_bits = int(w_bits)
+        self.prefix = prefix
+        self.input_dtype = None
+        self._processed = False
+        self._max_num_tokens = 2048
+        self._loaded_qweight_shards: set[int] = set()
+        self._loaded_scales_shards: set[int] = set()
+        self._loaded_qzeros_shards: set[int] = set()
+
+    def _resolve_shard_span(
+        self,
+        part_sizes: tuple[int, ...],
+        loaded_shard_id: int | tuple[int, ...] | None,
+    ) -> tuple[int, int, tuple[int, ...]]:
+        if loaded_shard_id is None:
+            return 0, sum(part_sizes), tuple(range(len(part_sizes)))
+        if isinstance(loaded_shard_id, int):
+            if not 0 <= loaded_shard_id < len(part_sizes):
+                raise ValueError(
+                    f"Invalid shard_id={loaded_shard_id} for {self.prefix!r} (partitions={len(part_sizes)})"
+                )
+            return (
+                sum(part_sizes[:loaded_shard_id]),
+                part_sizes[loaded_shard_id],
+                (loaded_shard_id,),
+            )
+        if isinstance(loaded_shard_id, tuple) and loaded_shard_id:
+            lo, hi = loaded_shard_id[0], loaded_shard_id[-1]
+            if (
+                lo < 0
+                or hi >= len(part_sizes)
+                or list(loaded_shard_id) != list(range(lo, hi + 1))
+            ):
+                raise ValueError(
+                    f"Invalid tuple shard_id={loaded_shard_id!r} for {self.prefix!r}"
+                )
+            return (
+                sum(part_sizes[:lo]),
+                sum(part_sizes[lo : hi + 1]),
+                tuple(range(lo, hi + 1)),
+            )
+        raise ValueError(f"Unsupported loaded_shard_id={loaded_shard_id!r} for {self.prefix!r}")
+
+    def _make_param_loader(self, layer: torch.nn.Module, kind: str):
+        w_bits = self.w_bits
+
+        @torch.no_grad()
+        def _loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            loaded_shard_id: int | tuple[int, ...] | None = None,
+        ) -> None:
+            k_in = int(layer._dxmoe_wna16_k)
+            part_sizes: tuple[int, ...] = layer._dxmoe_wna16_part_sizes
+            n_start, n_len, shard_indices = self._resolve_shard_span(
+                part_sizes, loaded_shard_id
+            )
+            if kind == "qweight":
+                exp_shape = ((k_in * w_bits) // 32, n_len)
+                if loaded_weight.dtype != torch.int32 or tuple(loaded_weight.shape) != exp_shape:
+                    raise ValueError(
+                        f"{self.prefix!r} qweight shard expected int32 {exp_shape}, "
+                        f"got {loaded_weight.dtype} {tuple(loaded_weight.shape)}"
+                    )
+                param.data[:, n_start : n_start + n_len].copy_(loaded_weight)
+                self._loaded_qweight_shards.update(shard_indices)
+            elif kind == "scales":
+                if not loaded_weight.is_floating_point() or tuple(loaded_weight.shape) not in (
+                    (1, n_len),
+                    (n_len,),
+                ):
+                    raise ValueError(
+                        f"{self.prefix!r} scales shard expected float (1, {n_len}), "
+                        f"got {loaded_weight.dtype} {tuple(loaded_weight.shape)}"
+                    )
+                param.data[:, n_start : n_start + n_len].copy_(
+                    loaded_weight.reshape(1, n_len).to(
+                        device=param.device, dtype=torch.float16
+                    )
+                )
+                self._loaded_scales_shards.update(shard_indices)
+            elif kind == "qzeros":
+                qz_start = (n_start * w_bits) // 32
+                qz_len = (n_len * w_bits) // 32
+                exp_shape = (1, qz_len)
+                if loaded_weight.dtype != torch.int32 or tuple(loaded_weight.shape) != exp_shape:
+                    raise ValueError(
+                        f"{self.prefix!r} qzeros shard expected int32 {exp_shape}, "
+                        f"got {loaded_weight.dtype} {tuple(loaded_weight.shape)}"
+                    )
+                param.data[:, qz_start : qz_start + qz_len].copy_(loaded_weight)
+                self._loaded_qzeros_shards.update(shard_indices)
+            else:
+                assert kind == "g_idx"
+                if loaded_weight.dtype != torch.int32 or tuple(loaded_weight.shape) != (k_in,):
+                    raise ValueError(
+                        f"{self.prefix!r} g_idx expected int32 ({k_in},), "
+                        f"got {loaded_weight.dtype} {tuple(loaded_weight.shape)}"
+                    )
+                if not bool((loaded_weight == 0).all()):
+                    raise ValueError(
+                        f"{self.prefix!r} channel-wise W{w_bits}A16 requires all-zero g_idx"
+                    )
+                param.data.copy_(loaded_weight)
+
+        return _loader
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs: Any,
+    ) -> None:
+        output_size_per_partition = sum(int(s) for s in output_partition_sizes)
+        if input_size != input_size_per_partition or output_size != output_size_per_partition:
+            raise ValueError(
+                f"DxMoEWNA16LinearMethod ({self.prefix!r}) requires single-GPU TP=1, "
+                f"got input={input_size_per_partition}/{input_size}, "
+                f"output={output_size_per_partition}/{output_size}"
+            )
+        elem_group = 32 if self.w_bits == 3 else (32 // self.w_bits)
+        if input_size <= 0 or input_size % elem_group != 0:
+            raise ValueError(
+                f"DxMoEWNA16LinearMethod ({self.prefix!r}) W{self.w_bits} requires K={input_size} "
+                f"divisible by {elem_group}"
+            )
+        part_tuple = tuple(int(s) for s in output_partition_sizes)
+        if not part_tuple or any(s <= 0 or s % elem_group != 0 for s in part_tuple):
+            raise ValueError(
+                f"DxMoEWNA16LinearMethod ({self.prefix!r}) W{self.w_bits} requires output "
+                f"partitions {part_tuple} divisible by {elem_group}"
+            )
+
+        vllm_cfg = get_current_vllm_config_or_none()
+        if vllm_cfg is not None and vllm_cfg.scheduler_config is not None:
+            self._max_num_tokens = max(
+                int(getattr(vllm_cfg.scheduler_config, "max_num_batched_tokens", 2048)),
+                1,
+            )
+
+        layer._dxmoe_wna16_k = int(input_size)
+        layer._dxmoe_wna16_n = int(output_size)
+        layer._dxmoe_wna16_part_sizes = part_tuple
+
+        qw_init = torch.zeros(
+            ((input_size * self.w_bits) // 32, output_size), dtype=torch.int32
+        )
+        sc_init = torch.ones((1, output_size), dtype=torch.float16)
+        qz_cols = (output_size * self.w_bits) // 32
+        if self.w_bits == 3:
+            qz_init = (
+                torch.tensor(GPTQ_SYM_QZEROS_W3, dtype=torch.int32)
+                .repeat(output_size // 32)
+                .reshape(1, qz_cols)
+                .contiguous()
+            )
+        else:
+            qz_init = torch.full(
+                (1, qz_cols), GPTQ_SYM_QZEROS[self.w_bits], dtype=torch.int32
+            )
+        gidx_init = torch.zeros((input_size,), dtype=torch.int32)
+
+        for name, init_t, kind in (
+            ("qweight", qw_init, "qweight"),
+            ("scales", sc_init, "scales"),
+            ("qzeros", qz_init, "qzeros"),
+            ("g_idx", gidx_init, "g_idx"),
+        ):
+            p = torch.nn.Parameter(init_t, requires_grad=False)
+            layer.register_parameter(name, p)
+            set_weight_attrs(p, extra_weight_attrs)
+            p.weight_loader = self._make_param_loader(layer, kind)  # type: ignore[attr-defined]
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self._processed or is_weights_pre_processed():
+            return
+        self._processed = True
+
+        vllm_cfg = get_current_vllm_config_or_none()
+        is_dummy_load = (
+            vllm_cfg is not None
+            and vllm_cfg.load_config is not None
+            and vllm_cfg.load_config.load_format == "dummy"
+        )
+        part_sizes: tuple[int, ...] = layer._dxmoe_wna16_part_sizes
+        expected_shards = set(range(len(part_sizes)))
+        if not is_dummy_load:
+            for label, loaded_set in (
+                ("qweight", self._loaded_qweight_shards),
+                ("scales", self._loaded_scales_shards),
+                ("qzeros", self._loaded_qzeros_shards),
+            ):
+                missing = sorted(expected_shards - loaded_set)
+                if missing:
+                    raise ValueError(
+                        f"DxMoEWNA16LinearMethod ({self.prefix!r}) missing GPTQ {label} shards: {missing}"
+                    )
+
+        k_orig = int(layer._dxmoe_wna16_k)
+        n_orig = int(layer._dxmoe_wna16_n)
+        device = layer.qweight.device
+
+        validate_gptq_qzeros_shard(
+            layer.qzeros.data, n_expected=n_orig, w_bits=self.w_bits
+        )
+        s_f16 = validate_gptq_scales_shard(
+            layer.scales.data, n_expected=n_orig, target_device=device
+        )
+        codes = repack_gptq_qweight_shard(
+            layer.qweight.data,
+            k_expected=k_orig,
+            n_expected=n_orig,
+            w_bits=self.w_bits,
+            target_device=device,
+        )
+
+        k_pad = round_up(k_orig, 128)
+        n_pad = round_up(n_orig, 256)
+        row_bytes_orig = dxmoe_packed_row_bytes(k_orig, self.w_bits)
+        row_bytes_pad = dxmoe_packed_row_bytes(k_pad, self.w_bits)
+        if k_pad == k_orig and n_pad == n_orig:
+            codes_pad = codes.contiguous()
+            scales_pad = s_f16.contiguous()
+        else:
+            if self.w_bits == 2:
+                codes_pad = torch.full(
+                    (n_pad, row_bytes_pad), 0xAA, dtype=torch.uint8, device=device
+                )
+            else:
+                zero_pat = torch.tensor(
+                    [0x24, 0x92, 0x49], dtype=torch.uint8, device=device
+                )
+                codes_pad = (
+                    zero_pat.repeat(row_bytes_pad // 3)
+                    .unsqueeze(0)
+                    .expand(n_pad, row_bytes_pad)
+                    .clone()
+                )
+            codes_pad[:n_orig, :row_bytes_orig].copy_(codes)
+            scales_pad = torch.ones((n_pad,), dtype=torch.float16, device=device)
+            scales_pad[:n_orig].copy_(s_f16)
+
+        for name in ("qweight", "scales", "qzeros", "g_idx"):
+            if hasattr(layer, name):
+                delattr(layer, name)
+
+        layer.register_parameter(
+            "_dxmoe_wna16_codes",
+            torch.nn.Parameter(codes_pad, requires_grad=False),
+        )
+        layer.register_parameter(
+            "_dxmoe_wna16_scales",
+            torch.nn.Parameter(scales_pad, requires_grad=False),
+        )
+        layer._dxmoe_wna16_k_pad = int(k_pad)
+        layer._dxmoe_wna16_n_pad = int(n_pad)
+        layer.register_buffer(
+            "_dxmoe_wna16_w_bits_dev",
+            torch.tensor([self.w_bits], dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        layer.register_buffer(
+            "_dxmoe_wna16_w_ptrs_dev",
+            torch.tensor([int(codes_pad.data_ptr())], dtype=torch.int64, device=device),
+            persistent=False,
+        )
+        layer.register_buffer(
+            "_dxmoe_wna16_sw_ptrs_dev",
+            torch.tensor([int(scales_pad.data_ptr())], dtype=torch.int64, device=device),
+            persistent=False,
+        )
+
+        if device.type == "cuda":
+            bundle = get_dxmoe_lib_bundle(device)
+            get_dxmoe_wna16_linear_workspace(
+                num_tokens=1,
+                max_num_tokens=self._max_num_tokens,
+                k_pad=k_pad,
+                n_pad=n_pad,
+                device=device,
+                bundle=bundle,
+            )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        k_orig = int(layer._dxmoe_wna16_k)
+        n_orig = int(layer._dxmoe_wna16_n)
+        k_pad = int(layer._dxmoe_wna16_k_pad)
+        n_pad = int(layer._dxmoe_wna16_n_pad)
+        if x.shape[-1] != k_orig:
+            raise ValueError(
+                f"DxMoEWNA16LinearMethod ({self.prefix!r}) expected input dim {k_orig}, "
+                f"got {tuple(x.shape)}"
+            )
+        codes_ptr = int(layer._dxmoe_wna16_codes.data_ptr())
+        scales_ptr = int(layer._dxmoe_wna16_scales.data_ptr())
+        # Refresh device pointer table if module parameters were relocated after loading.
+        if getattr(layer, "_dxmoe_wna16_cached_ptrs", None) != (codes_ptr, scales_ptr):
+            dev = layer._dxmoe_wna16_codes.device
+            layer._dxmoe_wna16_w_ptrs_dev = torch.tensor(
+                [codes_ptr], dtype=torch.int64, device=dev
+            )
+            layer._dxmoe_wna16_sw_ptrs_dev = torch.tensor(
+                [scales_ptr], dtype=torch.int64, device=dev
+            )
+            layer._dxmoe_wna16_cached_ptrs = (codes_ptr, scales_ptr)
+
+        x_2d = x.reshape(-1, k_orig)
+        out_2d = run_dxmoe_wna16_linear(
+            x_2d,
+            w_bits_dev=layer._dxmoe_wna16_w_bits_dev,
+            w_ptrs_dev=layer._dxmoe_wna16_w_ptrs_dev,
+            sw_ptrs_dev=layer._dxmoe_wna16_sw_ptrs_dev,
+            k_orig=k_orig,
+            n_orig=n_orig,
+            k_pad=k_pad,
+            n_pad=n_pad,
+            max_num_tokens=self._max_num_tokens,
+        )
+        out = out_2d.reshape(*x.shape[:-1], n_orig)
+        if bias is not None:
+            out = out + bias
+        return out
+
+
 class DxMoEMoEMethod(FusedMoEMethodBase):
-    """Zero-peak streaming FusedMoE method for GPTQ-packed or float DxMoE W4/W8 weights."""
+    """Zero-peak streaming FusedMoE method for GPTQ-packed or float DxMoE W2/W3/W4/W8 weights."""
 
     def __init__(
         self,
@@ -1226,7 +1604,7 @@ class DxMoEMoEMethod(FusedMoEMethodBase):
                     w_bits=w_bits,
                     target_device=target_dev,
                 )
-                row_bytes = k_exp // 2 if w_bits == 4 else k_exp
+                row_bytes = dxmoe_packed_row_bytes(k_exp, w_bits)
                 shard_nbytes = n_exp * row_bytes
                 base_off = (
                     self._w13_offsets[local_e] if is_entry else self._w2_offsets[local_e]
@@ -1298,7 +1676,7 @@ class DxMoEMoEMethod(FusedMoEMethodBase):
             packed, s_f16 = pack_dxmoe_float_matrix(
                 loaded_weight.to(device=codes_buf.device), w_bits
             )
-            row_bytes = k_exp // 2 if w_bits == 4 else k_exp
+            row_bytes = dxmoe_packed_row_bytes(k_exp, w_bits)
             shard_nbytes = n_exp * row_bytes
             base_off = (
                 self._w13_offsets[local_e] if is_entry else self._w2_offsets[local_e]

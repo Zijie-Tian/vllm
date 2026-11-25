@@ -337,7 +337,7 @@ def get_dxmoe_lib_bundle(device: torch.device) -> DxMoELibBundle:
 
 @dataclass(frozen=True)
 class DxMoELayerWeights:
-    """Packed symmetric G=-1 W4/W8 expert payload for one MoE projection stage."""
+    """Packed symmetric G=-1 W2/W3/W4/W8 expert payload for one MoE projection stage."""
 
     num_experts: int
     n: int
@@ -350,11 +350,18 @@ class DxMoELayerWeights:
     has_w8: bool
 
 
+SUPPORTED_W_BITS: tuple[int, ...] = (2, 3, 4, 8)
+
 GPTQ_SYM_QZEROS: dict[int, int] = {
+    2: 0x55555555,
     4: 0x77777777,
     8: 0x7F7F7F7F,
 }
+# Signed int32 representation of (0xDB6DB6DB, 0xB6DB6DB6, 0x6DB6DB6D) for symmetric W3 (zero - 1 = 3).
+GPTQ_SYM_QZEROS_W3: tuple[int, int, int] = (-0x24924925, -0x4924924A, 0x6DB6DB6D)
 
+_W2_REFIT_DENOMS: tuple[float, ...] = (2.0, 1.5, 1.0)
+_W3_REFIT_DENOMS: tuple[float, ...] = (4.0, 3.5, 3.0, 2.5, 2.0, 1.5, 1.0)
 _W4_REFIT_DENOMS: tuple[float, ...] = (8.0, 7.5, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0)
 _W8_REFIT_DENOMS: tuple[float, ...] = tuple(float(m) for m in range(128, 95, -1)) + (
     127.5,
@@ -368,6 +375,17 @@ _W8_REFIT_DENOMS: tuple[float, ...] = tuple(float(m) for m in range(128, 95, -1)
     2.0,
     1.0,
 )
+
+
+def dxmoe_packed_row_bytes(k: int, w_bits: int) -> int:
+    """Return exact packed byte width `(K * w_bits) // 8` for one output channel."""
+    if w_bits not in SUPPORTED_W_BITS:
+        raise ValueError(
+            f"DxMoE native kernel requires w_bits in {SUPPORTED_W_BITS}, got {w_bits!r}"
+        )
+    if k <= 0 or (k * w_bits) % 8 != 0:
+        raise ValueError(f"Invalid K={k} for W{w_bits} row byte packing")
+    return (k * w_bits) // 8
 
 
 def compute_dxmoe_arena_layout(
@@ -387,15 +405,15 @@ def compute_dxmoe_arena_layout(
             f"got E={num_experts}, N={n}, K={k}"
         )
     bits_clean = tuple(int(b) for b in w_bits_list)
-    if any(b not in (4, 8) for b in bits_clean):
+    if any(b not in SUPPORTED_W_BITS for b in bits_clean):
         raise ValueError(
-            f"DxMoE native kernel requires expert w_bits in {{4, 8}}, got {set(bits_clean)}"
+            f"DxMoE native kernel requires expert w_bits in {{2, 3, 4, 8}}, got {set(bits_clean)}"
         )
     expert_offsets: list[int] = []
     running_bytes = 0
     for b in bits_clean:
         expert_offsets.append(running_bytes)
-        expert_bytes = n * (k // 2 if b == 4 else k)
+        expert_bytes = n * ((k * b) // 8)
         running_bytes = round_up(running_bytes + expert_bytes, 256)
     return bits_clean, tuple(expert_offsets), max(running_bytes, 256)
 
@@ -461,11 +479,17 @@ def repack_gptq_qweight_shard(
     w_bits: int,
     target_device: torch.device,
 ) -> torch.Tensor:
-    """Bit-losslessly transpose GPTQ `int32 [K // pf, N]` into DxMoE `uint8 [N, K * w_bits // 8]`."""
-    if w_bits not in (4, 8):
-        raise ValueError(f"Unsupported DxMoE w_bits={w_bits}; expected 4 or 8")
-    pack_factor = 32 // w_bits
-    expected_shape = (k_expected // pack_factor, n_expected)
+    """Bit-losslessly transpose GPTQ `int32 [(K * w_bits) // 32, N]` into DxMoE `uint8 [N, K * w_bits // 8]`."""
+    if w_bits not in SUPPORTED_W_BITS:
+        raise ValueError(
+            f"Unsupported DxMoE w_bits={w_bits}; expected one of {SUPPORTED_W_BITS}"
+        )
+    if k_expected <= 0 or n_expected <= 0 or (k_expected * w_bits) % 32 != 0:
+        raise ValueError(
+            f"Expected positive K, N with (K * w_bits) % 32 == 0 for W{w_bits}, "
+            f"got K={k_expected}, N={n_expected}"
+        )
+    expected_shape = ((k_expected * w_bits) // 32, n_expected)
     if (
         not isinstance(qweight, torch.Tensor)
         or qweight.ndim != 2
@@ -519,10 +543,15 @@ def validate_gptq_qzeros_shard(
     w_bits: int,
 ) -> None:
     """Validate channel-wise (`group_size == -1`) symmetric `gptq-v1` `qzeros`."""
-    if w_bits not in GPTQ_SYM_QZEROS:
-        raise ValueError(f"Unsupported DxMoE w_bits={w_bits}")
-    pack_factor = 32 // w_bits
-    expected_shape = (1, n_expected // pack_factor)
+    if w_bits not in SUPPORTED_W_BITS:
+        raise ValueError(
+            f"Unsupported DxMoE w_bits={w_bits}; expected one of {SUPPORTED_W_BITS}"
+        )
+    if n_expected <= 0 or (n_expected * w_bits) % 32 != 0:
+        raise ValueError(
+            f"Expected positive N with (N * w_bits) % 32 == 0 for W{w_bits}, got N={n_expected}"
+        )
+    expected_shape = (1, (n_expected * w_bits) // 32)
     if not isinstance(qzeros, torch.Tensor) or qzeros.dtype != torch.int32:
         raise ValueError(f"GPTQ qzeros must be int32, got {getattr(qzeros, 'dtype', None)}")
     if qzeros.ndim == 2 and qzeros.shape[0] != 1:
@@ -534,12 +563,22 @@ def validate_gptq_qzeros_shard(
         raise ValueError(
             f"Expected GPTQ qzeros shape {expected_shape} for W{w_bits}, got {tuple(qzeros.shape)}"
         )
-    expected_val = GPTQ_SYM_QZEROS[w_bits]
-    if not bool((qzeros == expected_val).all()):
-        raise ValueError(
-            f"DxMoE native operator requires symmetric gptq-v1 qzeros "
-            f"(expected 0x{expected_val:08x} for W{w_bits})"
-        )
+    if w_bits == 3:
+        expected_w3 = torch.tensor(
+            GPTQ_SYM_QZEROS_W3, dtype=torch.int32, device=qzeros.device
+        ).view(1, 1, 3)
+        if not bool((qzeros.reshape(1, n_expected // 32, 3) == expected_w3).all()):
+            raise ValueError(
+                "DxMoE native operator requires symmetric gptq-v1 qzeros "
+                "(expected (0xdb6db6db, 0xb6db6db6, 0x6db6db6d) per 32 channels for W3)"
+            )
+    else:
+        expected_val = GPTQ_SYM_QZEROS[w_bits]
+        if not bool((qzeros == expected_val).all()):
+            raise ValueError(
+                f"DxMoE native operator requires symmetric gptq-v1 qzeros "
+                f"(expected 0x{expected_val:08x} for W{w_bits})"
+            )
 
 
 @torch.no_grad()
@@ -550,14 +589,24 @@ def pack_dxmoe_float_matrix(
     """Refit and pack one 2D symmetric G=-1 float weight `[N, K]` to `(packed_u8, scales_f16)`."""
     if weight_2d.ndim != 2:
         raise ValueError(f"Expected 2D weight [N, K], got {tuple(weight_2d.shape)}")
-    if w_bits not in (4, 8):
-        raise ValueError(f"Expected w_bits in {{4, 8}}, got {w_bits!r}")
+    if w_bits not in SUPPORTED_W_BITS:
+        raise ValueError(f"Expected w_bits in {SUPPORTED_W_BITS}, got {w_bits!r}")
     n, k = int(weight_2d.shape[0]), int(weight_2d.shape[1])
+    dxmoe_packed_row_bytes(k, w_bits)
     device = weight_2d.device
     w_f32 = weight_2d.to(dtype=torch.float32)
-    qmin_abs, qmax_pos, zero = (8.0, 7.0, 8) if w_bits == 4 else (128.0, 127.0, 128)
+    zero = 1 << (w_bits - 1)
+    qmin_abs = float(zero)
+    qmax_pos = float(zero - 1)
     amax = w_f32.abs().amax(dim=-1)
-    denoms = _W4_REFIT_DENOMS if w_bits == 4 else _W8_REFIT_DENOMS
+    if w_bits == 2:
+        denoms = _W2_REFIT_DENOMS
+    elif w_bits == 3:
+        denoms = _W3_REFIT_DENOMS
+    elif w_bits == 4:
+        denoms = _W4_REFIT_DENOMS
+    else:
+        denoms = _W8_REFIT_DENOMS
 
     best_err = torch.full((n,), float("inf"), dtype=torch.float32, device=device)
     best_s = torch.ones((n,), dtype=torch.float16, device=device)
@@ -585,11 +634,26 @@ def pack_dxmoe_float_matrix(
             )
 
     u8 = (best_q + zero).to(dtype=torch.uint8)
-    packed = (
-        (u8[:, 0::2] | (u8[:, 1::2] << 4)).contiguous()
-        if w_bits == 4
-        else u8.contiguous()
-    )
+    if w_bits == 2:
+        packed = (
+            u8[:, 0::4]
+            | (u8[:, 1::4] << 2)
+            | (u8[:, 2::4] << 4)
+            | (u8[:, 3::4] << 6)
+        ).contiguous()
+    elif w_bits == 3:
+        g = u8.reshape(n, k // 8, 8).to(dtype=torch.int32)
+        u24 = torch.zeros((n, k // 8), dtype=torch.int32, device=device)
+        for idx in range(8):
+            u24 = u24 | ((g[..., idx] & 0x7) << (3 * idx))
+        b0 = (u24 & 0xFF).to(dtype=torch.uint8)
+        b1 = ((u24 >> 8) & 0xFF).to(dtype=torch.uint8)
+        b2 = ((u24 >> 16) & 0xFF).to(dtype=torch.uint8)
+        packed = torch.stack((b0, b1, b2), dim=-1).reshape(n, (k * 3) // 8).contiguous()
+    elif w_bits == 4:
+        packed = (u8[:, 0::2] | (u8[:, 1::2] << 4)).contiguous()
+    else:
+        packed = u8.contiguous()
     return packed, best_s
 
 
@@ -843,3 +907,222 @@ def get_dxmoe_shared_workspace(
         ws = _factory()
         _FALLBACK_WORKSPACES[key] = ws
     return ws
+
+
+class DxMoEWNA16LinearWorkspace:
+    """Persistent `E=1, topk=1, A16` scratch for native W2A16/W3A16 non-routed Linears."""
+
+    def __init__(
+        self,
+        *,
+        max_tokens: int,
+        k_pad: int,
+        n_pad: int,
+        device: torch.device,
+        bundle: DxMoELibBundle,
+    ) -> None:
+        self.max_tokens = max(1, int(max_tokens))
+        self.k_pad = int(k_pad)
+        self.n_pad = int(n_pad)
+        self.device = device
+
+        t_max = self.max_tokens
+        self.expert_ids = torch.zeros((t_max,), dtype=torch.int32, device=device)
+        self.activation_bits = torch.full(
+            (t_max,), 16, dtype=torch.int32, device=device
+        )
+        # Unused A4/A8 pool base addresses (never written when activation_bits == 16).
+        self.pool_a4 = torch.empty((256,), dtype=torch.uint8, device=device)
+        self.pool_a8 = torch.empty((256,), dtype=torch.int8, device=device)
+        self.pool_a16 = torch.empty(
+            (t_max, self.k_pad), dtype=torch.float16, device=device
+        )
+        self.scale_a4 = torch.empty((16,), dtype=torch.float32, device=device)
+        self.scale_a8 = torch.empty((16,), dtype=torch.float32, device=device)
+        self.pool_offsets = tuple(
+            torch.empty((2,), dtype=torch.int32, device=device) for _ in range(3)
+        )
+        self.out_f16 = torch.empty(
+            (t_max, self.n_pad), dtype=torch.float16, device=device
+        )
+        self.tasks = torch.empty(
+            (4, _TASK_COLUMNS), dtype=torch.int64, device=device
+        )
+        self.counts = torch.empty((_COUNTS_LEN,), dtype=torch.int32, device=device)
+        self.status = torch.zeros((1,), dtype=torch.int32, device=device)
+        ws_bytes = bundle.reorder_workspace_bytes(t_max, 1, 1)
+        self.reorder_ws = torch.empty((ws_bytes,), dtype=torch.uint8, device=device)
+
+        self.pool_data_ptrs = (ctypes.c_int64 * 3)(
+            int(self.pool_a4.data_ptr()),
+            int(self.pool_a8.data_ptr()),
+            int(self.pool_a16.data_ptr()),
+        )
+        self.pool_scale_ptrs = (ctypes.c_int64 * 2)(
+            int(self.scale_a4.data_ptr()),
+            int(self.scale_a8.data_ptr()),
+        )
+        self.zero_ptrs_2 = (ctypes.c_int64 * 2)(0, 0)
+        self.zero_ptrs_3 = (ctypes.c_int64 * 3)(0, 0, 0)
+        self.pool_offsets_ptrs = (ctypes.c_int64 * 3)(
+            *(int(t.data_ptr()) for t in self.pool_offsets)
+        )
+        self.out_ptrs = (ctypes.c_int64 * 3)(int(self.out_f16.data_ptr()), 0, 0)
+
+        dev_idx = 0 if device.index is None else int(device.index)
+        with _WORKSPACE_LOCK:
+            _ACTIVE_WORKSPACES_BY_DEVICE.setdefault(dev_idx, []).append(
+                weakref.ref(self)  # type: ignore[arg-type]
+            )
+
+    def assert_healthy_and_reset(self) -> None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "DxMoEWNA16LinearWorkspace.assert_healthy_and_reset() must run outside CUDA Graph capture"
+            )
+        code = int(self.status.item())
+        if code != 0:
+            self.status.zero_()
+            detail = DXMOE_STATUS_MESSAGES.get(code, f"native status code {code}")
+            raise RuntimeError(
+                f"DxMoE native WNA16 linear latched error status={code}: {detail}"
+            )
+
+
+def get_dxmoe_wna16_linear_workspace(
+    *,
+    num_tokens: int,
+    max_num_tokens: int,
+    k_pad: int,
+    n_pad: int,
+    device: torch.device,
+    bundle: DxMoELibBundle,
+) -> DxMoEWNA16LinearWorkspace:
+    cap_tokens = max(int(num_tokens), int(max_num_tokens), 1)
+    key = (
+        DxMoEWNA16LinearWorkspace,
+        cap_tokens,
+        int(k_pad),
+        int(n_pad),
+        device,
+    )
+
+    def _factory() -> DxMoEWNA16LinearWorkspace:
+        return DxMoEWNA16LinearWorkspace(
+            max_tokens=cap_tokens,
+            k_pad=k_pad,
+            n_pad=n_pad,
+            device=device,
+            bundle=bundle,
+        )
+
+    if is_workspace_manager_initialized():
+        return current_workspace_manager().get_persistent_resource(key, _factory)
+
+    ws = _FALLBACK_WORKSPACES.get(key)  # type: ignore[assignment]
+    if ws is None:
+        ws = _factory()  # type: ignore[assignment]
+        _FALLBACK_WORKSPACES[key] = ws
+    return ws  # type: ignore[return-value]
+
+
+def run_dxmoe_wna16_linear(
+    x_2d: torch.Tensor,
+    *,
+    w_bits_dev: torch.Tensor,
+    w_ptrs_dev: torch.Tensor,
+    sw_ptrs_dev: torch.Tensor,
+    k_orig: int,
+    n_orig: int,
+    k_pad: int,
+    n_pad: int,
+    max_num_tokens: int,
+) -> torch.Tensor:
+    """Execute native CUDA W2A16/W3A16 GEMM on packed symmetric G=-1 weights."""
+    if x_2d.device.type != "cuda":
+        raise RuntimeError(
+            f"DxMoE native WNA16 linear requires a CUDA tensor, got device={x_2d.device}"
+        )
+    if x_2d.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"DxMoE native WNA16 linear requires float16 or bfloat16 activations, got {x_2d.dtype}"
+        )
+    m = int(x_2d.shape[0])
+    device = x_2d.device
+    if m == 0:
+        return torch.empty((0, n_orig), dtype=x_2d.dtype, device=device)
+
+    if k_orig < k_pad:
+        x_in = torch.zeros((m, k_pad), dtype=x_2d.dtype, device=device)
+        x_in[:, :k_orig].copy_(x_2d)
+    elif not x_2d.is_contiguous() or (int(x_2d.data_ptr()) % 16 != 0):
+        x_in = x_2d.contiguous()
+        if int(x_in.data_ptr()) % 16 != 0:
+            x_in = x_in.clone()
+    else:
+        x_in = x_2d
+
+    bundle = get_dxmoe_lib_bundle(device)
+    lib, (serial_ctas, cons_ctas, prod_ctas) = bundle.select(m)
+    ws = get_dxmoe_wna16_linear_workspace(
+        num_tokens=m,
+        max_num_tokens=max_num_tokens,
+        k_pad=k_pad,
+        n_pad=n_pad,
+        device=device,
+        bundle=bundle,
+    )
+    stream_ptr = ctypes.c_void_p(torch.cuda.current_stream(device).cuda_stream)
+
+    desc = NativeReorderDesc(
+        x=int(x_in.data_ptr()),
+        row_amax=0,
+        expert_ids=int(ws.expert_ids.data_ptr()),
+        activation_bits=int(ws.activation_bits.data_ptr()),
+        expert_w_bits=int(w_bits_dev.data_ptr()),
+        expert_w_ptrs=int(w_ptrs_dev.data_ptr()),
+        expert_sw_ptrs=int(sw_ptrs_dev.data_ptr()),
+        in_row_to_call=0,
+        out_row_to_call=0,
+        out_call_to_row=0,
+        pool_data=ws.pool_data_ptrs,
+        pool_scale=ws.pool_scale_ptrs,
+        pool_group_sum=ws.zero_ptrs_2,
+        pool_offsets=ws.pool_offsets_ptrs,
+        pool_call_ids=ws.zero_ptrs_3,
+        pool_outputs=ws.out_ptrs,
+        workspace=int(ws.reorder_ws.data_ptr()),
+        tasks=int(ws.tasks.data_ptr()),
+        counts=int(ws.counts.data_ptr()),
+        status=int(ws.status.data_ptr()),
+        is_padding=0,
+        num_tokens=m,
+        topk=1,
+        num_experts=1,
+        k=k_pad,
+        n=n_pad,
+        rows_are_calls=0,
+        x_dtype=DTYPE_CODE[x_in.dtype],
+        a16_dtype=0,
+        group_size=-1,
+        compact_outputs=1,
+        num_valid_tokens=m,
+        preserve_prior_status=1,
+    )
+    err = int(
+        lib.smoe_dxmoe_fused_run(
+            ctypes.byref(desc),
+            serial_ctas,
+            cons_ctas,
+            prod_ctas,
+            0,
+            stream_ptr,
+        )
+    )
+    if err != 0:
+        raise RuntimeError(f"DxMoE native WNA16 linear failed with CUDA status {err}")
+
+    out_view = ws.out_f16[:m, :n_orig]
+    if x_2d.dtype == torch.float16:
+        return out_view.clone()
+    return out_view.to(dtype=x_2d.dtype)
